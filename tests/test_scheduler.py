@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+import difflib
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+
+def run_case(binary: str, name: str, interaction: str, expected: str) -> None:
+    result = subprocess.run(
+        [binary],
+        input=interaction,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{name}: exited {result.returncode}\n"
+            f"stdout before exit:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    if result.stdout != expected:
+        diff = "".join(
+            difflib.unified_diff(
+                expected.splitlines(keepends=True),
+                result.stdout.splitlines(keepends=True),
+                fromfile="expected",
+                tofile="actual",
+            )
+        )
+        raise AssertionError(f"{name}: protocol output mismatch\n{diff}")
+
+
+def clean(value: str) -> str:
+    return textwrap.dedent(value).lstrip()
+
+
+def main() -> int:
+    binary = sys.argv[1] if len(sys.argv) > 1 else "./scheduler"
+    fixtures = Path(__file__).parent / "fixtures"
+    run_case(
+        binary,
+        "public example",
+        (fixtures / "public_example.in").read_text(),
+        (fixtures / "public_example.out").read_text(),
+    )
+
+    run_case(
+        binary,
+        "decode cycle and FIN override",
+        clean(
+            """
+            1 1.000000000 2.000000000 1.000000000 100 1
+            30.000000000 15.000000000 1.000000000 0.000000000 0.000000000 0.500000000 0.500000000
+            2
+            1 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000
+            2 2.000000000 2.000000000 2.000000000 2.000000000 2.000000000 2.000000000
+            0.000000000
+            1
+            ARR 0 1
+            1.000000000
+            1
+            TDN E P PRE 0 0 1.000000000
+            2.000000000
+            1
+            XDN UP 0 100 PRE 1 0
+            3.000000000
+            1
+            TDN C0 P PROC 0 1 0 0 1.000000000
+            4.000000000
+            1
+            XDN DOWN 0 100 PRE 1 0
+            5.000000000
+            1
+            TDN E P POST 0 0 1.000000000
+            6.000000000
+            1
+            TDN E D PRE -1 1 0 1.000000000
+            7.000000000
+            1
+            XDN UP 0 100 DEC 1 0
+            8.000000000
+            1
+            TDN C0 D PROC 0 1 0 1.000000000
+            9.000000000
+            1
+            XDN DOWN 0 100 DEC 1 0
+            10.000000000
+            1
+            TDN E D POST -1 1 0 1.000000000
+            11.000000000
+            1
+            TDN E D PRE -1 1 0 1.000000000
+            12.000000000
+            1
+            XDN UP 0 100 DEC 1 0
+            13.000000000
+            1
+            TDN C0 D PROC 0 1 0 1.000000000
+            14.000000000
+            1
+            XDN DOWN 0 100 DEC 1 0
+            15.000000000
+            2
+            FIN 0
+            TDN E D POST -1 1 0 1.000000000
+            END
+            """
+        ),
+        clean(
+            """
+            1
+            E P PRE 0 0
+            0
+            1
+            C0 P PROC 0 1 0 0
+            0
+            1
+            E P POST 0 0
+            1
+            E D PRE -1 1 0
+            0
+            1
+            C0 D PROC 0 1 0
+            0
+            1
+            E D POST -1 1 0
+            1
+            E D PRE -1 1 0
+            0
+            1
+            C0 D PROC 0 1 0
+            0
+            1
+            E D POST -1 1 0
+            0
+            """
+        ),
+    )
+
+    run_case(
+        binary,
+        "timing-aware decode batching across independent remotes",
+        clean(
+            """
+            2 1.000000000 2.000000000 1.000000000 100 1
+            30.000000000 15.000000000 1.000000000 0.000000000 0.000000000 0.500000000 0.500000000
+            2
+            1 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000
+            4 2.000000000 2.000000000 2.000000000 2.000000000 2.000000000 2.000000000
+            0.000000000
+            3
+            ARR 0 1
+            ARR 1 1
+            ARR 2 1
+            1.000000000
+            1
+            TDN E P PRE 0 0 1.000000000
+            2.000000000
+            1
+            XDN UP 0 100 PRE 1 0
+            3.000000000
+            1
+            TDN E P PRE 1 1 1.000000000
+            4.000000000
+            1
+            XDN UP 1 100 PRE 1 1
+            5.000000000
+            1
+            TDN E P PRE 0 2 1.000000000
+            6.000000000
+            1
+            XDN UP 0 100 PRE 1 2
+            7.000000000
+            1
+            TDN C0 P PROC 0 1 0 0 1.000000000
+            8.000000000
+            1
+            XDN DOWN 0 100 PRE 1 0
+            9.000000000
+            1
+            TDN C1 P PROC 0 1 1 1 1.000000000
+            10.000000000
+            3
+            XDN DOWN 1 100 PRE 1 1
+            TDN C0 P PROC 0 1 0 2 1.000000000
+            TDN E P POST 0 0 1.000000000
+            11.000000000
+            1
+            TDN E P POST 1 1 1.000000000
+            12.000000000
+            1
+            TDN E D PRE -1 2 0 1 1.333333333
+            13.000000000
+            1
+            XDN UP 0 100 DEC 1 0
+            14.000000000
+            1
+            XDN UP 1 100 DEC 1 1
+            15.000000000
+            1
+            XDN DOWN 0 100 PRE 1 2
+            16.000000000
+            1
+            TDN E P POST 0 2 1.000000000
+            17.000000000
+            1
+            TDN C0 D PROC 0 1 0 1.000000000
+            18.000000000
+            1
+            TDN C1 D PROC 1 1 1 1.000000000
+            19.000000000
+            1
+            XDN DOWN 0 100 DEC 1 0
+            20.000000000
+            1
+            XDN DOWN 1 100 DEC 1 1
+            21.000000000
+            1
+            TDN E D PRE -1 1 2 1.000000000
+            22.000000000
+            3
+            FIN 0
+            TDN E D POST -1 2 0 1 1.333333333
+            FIN 1
+            23.000000000
+            1
+            XDN UP 0 100 DEC 1 2
+            24.000000000
+            1
+            TDN C0 D PROC 0 1 2 1.000000000
+            25.000000000
+            1
+            XDN DOWN 0 100 DEC 1 2
+            26.000000000
+            2
+            TDN E D POST -1 1 2 1.000000000
+            FIN 2
+            END
+            """
+        ),
+        clean(
+            """
+            1
+            E P PRE 0 0
+            1
+            E P PRE 1 1
+            1
+            C0 P PROC 0 1 0 0
+            1
+            E P PRE 0 2
+            1
+            C1 P PROC 0 1 1 1
+            0
+            0
+            1
+            C0 P PROC 0 1 0 2
+            1
+            E P POST 0 0
+            0
+            1
+            E P POST 1 1
+            1
+            E D PRE -1 2 0 1
+            0
+            1
+            C0 D PROC 0 1 0
+            1
+            C1 D PROC 1 1 1
+            1
+            E P POST 0 2
+            1
+            E D PRE -1 1 2
+            0
+            0
+            0
+            0
+            1
+            E D POST -1 2 0 1
+            0
+            1
+            C0 D PROC 0 1 2
+            0
+            1
+            E D POST -1 1 2
+            0
+            """
+        ),
+    )
+
+    print("3 scheduler regression cases passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
