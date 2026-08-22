@@ -64,6 +64,7 @@ struct Request {
     int remote = -1;
     RequestStage stage = RequestStage::READY_P_PRE;
     double arrival_time = 0.0;
+    double decode_ready_time = 0.0;
     bool finished = false;
 };
 
@@ -97,14 +98,14 @@ struct TaskTimingRow {
 };
 
 struct ReadyKey {
-    double arrival_time = 0.0;
+    double priority_time = 0.0;
     int rid = -1;
 };
 
 struct ReadyKeyLess {
     bool operator()(const ReadyKey& lhs, const ReadyKey& rhs) const {
-        return std::tie(lhs.arrival_time, lhs.rid) <
-               std::tie(rhs.arrival_time, rhs.rid);
+        return std::tie(lhs.priority_time, lhs.rid) <
+               std::tie(rhs.priority_time, rhs.rid);
     }
 };
 
@@ -140,7 +141,8 @@ public:
         }
 
         if (system_.remote_count <= 0 || system_.num_layers <= 0 ||
-            system_.bytes_per_token <= 0) {
+            system_.bytes_per_token <= 0 || scoring_.slo1 <= 0.0 ||
+            scoring_.slo2 <= 0.0) {
             return false;
         }
         if (!prepareDecodeBatching()) {
@@ -186,6 +188,7 @@ public:
             events.push_back(std::move(*event));
         }
 
+        current_time_ = timestamp;
         for (const Event& event : events) {
             if (event.kind != EventKind::FINISH && !applyEvent(event, timestamp)) {
                 return false;
@@ -215,9 +218,18 @@ public:
             bool found = false;
             const ReadySet& decode = ready_d_proc_[static_cast<std::size_t>(remote)];
             const ReadySet& prefill = ready_p_proc_[static_cast<std::size_t>(remote)];
-            if (!decode.empty()) {
+            const Request* overdue = mostOverdue({&decode, &prefill});
+            if (overdue != nullptr &&
+                overdue->stage == RequestStage::READY_P_PROC) {
+                task = {WorkKind::PREFILL, TaskStep::PROC, remote, 0,
+                        system_.num_layers, {overdue->rid}};
+                found = true;
+            } else if (!decode.empty()) {
+                const std::vector<int>& batch_sizes =
+                    overdue != nullptr ? fastest_decode_proc_batch_
+                                       : best_decode_proc_batch_;
                 task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
-                        oldestBatch(decode, best_decode_proc_batch_)};
+                        oldestBatch(decode, batch_sizes)};
                 found = true;
             } else if (!prefill.empty()) {
                 task = {WorkKind::PREFILL, TaskStep::PROC, remote, 0,
@@ -236,21 +248,38 @@ public:
 
         if (!edge_busy_) {
             TaskSpec task;
-            bool found = false;
-            if (!ready_d_post_.empty()) {
-                task = {WorkKind::DECODE, TaskStep::POST, -1, -1, -1,
-                        oldestBatch(ready_d_post_, best_decode_post_batch_)};
-                found = true;
+            const Request* overdue = mostOverdue(
+                {&ready_d_post_, &ready_p_post_, &ready_d_pre_, &ready_p_pre_});
+            std::optional<RequestStage> selected_stage;
+            if (overdue != nullptr) {
+                selected_stage = overdue->stage;
+            } else if (!ready_d_post_.empty()) {
+                selected_stage = RequestStage::READY_D_POST;
             } else if (!ready_p_post_.empty()) {
+                selected_stage = RequestStage::READY_P_POST;
+            } else if (!ready_d_pre_.empty()) {
+                selected_stage = RequestStage::READY_D_PRE;
+            } else if (!ready_p_pre_.empty()) {
+                selected_stage = RequestStage::READY_P_PRE;
+            }
+
+            if (selected_stage == RequestStage::READY_D_POST) {
+                const std::vector<int>& batch_sizes =
+                    overdue != nullptr ? fastest_decode_post_batch_
+                                       : best_decode_post_batch_;
+                task = {WorkKind::DECODE, TaskStep::POST, -1, -1, -1,
+                        oldestBatch(ready_d_post_, batch_sizes)};
+            } else if (selected_stage == RequestStage::READY_P_POST) {
                 const int rid = ready_p_post_.begin()->rid;
                 task = {WorkKind::PREFILL, TaskStep::POST,
                         requestAt(rid)->remote, -1, -1, {rid}};
-                found = true;
-            } else if (!ready_d_pre_.empty()) {
+            } else if (selected_stage == RequestStage::READY_D_PRE) {
+                const std::vector<int>& batch_sizes =
+                    overdue != nullptr ? fastest_decode_pre_batch_
+                                       : best_decode_pre_batch_;
                 task = {WorkKind::DECODE, TaskStep::PRE, -1, -1, -1,
-                        oldestBatch(ready_d_pre_, best_decode_pre_batch_)};
-                found = true;
-            } else if (!ready_p_pre_.empty()) {
+                        oldestBatch(ready_d_pre_, batch_sizes)};
+            } else if (selected_stage == RequestStage::READY_P_PRE) {
                 const int rid = ready_p_pre_.begin()->rid;
                 Request* request = requestAt(rid);
                 if (!invariant(request != nullptr && request->remote == -1)) {
@@ -260,10 +289,9 @@ public:
                 next_remote_ = (next_remote_ + 1) % system_.remote_count;
                 task = {WorkKind::PREFILL, TaskStep::PRE, request->remote, -1,
                         -1, {rid}};
-                found = true;
             }
 
-            if (found) {
+            if (selected_stage) {
                 Assignment assignment{-1, std::move(task)};
                 if (!startAssignment(assignment)) {
                     return assignments;
@@ -339,6 +367,21 @@ private:
         return choices;
     }
 
+    static std::vector<int> fastestBatchSizes(const TimingCurve& curve) {
+        std::vector<int> choices(kMaxRequests + 1, 1);
+        double best_time = std::numeric_limits<double>::infinity();
+        int best_size = 1;
+        for (int size = 1; size <= kMaxRequests; ++size) {
+            const double time = lookupTime(curve, size);
+            if (time < best_time) {
+                best_time = time;
+                best_size = size;
+            }
+            choices[static_cast<std::size_t>(size)] = best_size;
+        }
+        return choices;
+    }
+
     bool prepareDecodeBatching() {
         TimingCurve decode_pre;
         TimingCurve decode_proc;
@@ -363,6 +406,9 @@ private:
         best_decode_pre_batch_ = bestBatchSizes(decode_pre);
         best_decode_proc_batch_ = bestBatchSizes(decode_proc);
         best_decode_post_batch_ = bestBatchSizes(decode_post);
+        fastest_decode_pre_batch_ = fastestBatchSizes(decode_pre);
+        fastest_decode_proc_batch_ = fastestBatchSizes(decode_proc);
+        fastest_decode_post_batch_ = fastestBatchSizes(decode_post);
         return true;
     }
 
@@ -380,6 +426,48 @@ private:
             request_ids.push_back(it->rid);
         }
         return request_ids;
+    }
+
+    static bool isPrefillStage(RequestStage stage) {
+        return stage >= RequestStage::READY_P_PRE &&
+               stage <= RequestStage::RUNNING_P_POST;
+    }
+
+    double normalizedLateness(const Request& request) const {
+        // ponytail: hard end-to-end deadlines only; add remaining-work slack
+        // estimates only if judge measurements justify prediction complexity.
+        const bool prefill = isPrefillStage(request.stage);
+        const double target = prefill ? scoring_.slo1 : scoring_.slo2;
+        const double reference =
+            prefill ? request.arrival_time : request.decode_ready_time;
+        return (current_time_ - reference - target) / target;
+    }
+
+    const Request* mostOverdue(
+        std::initializer_list<const ReadySet*> ready_sets) const {
+        const Request* best = nullptr;
+        double best_lateness = -1.0;
+        for (const ReadySet* ready : ready_sets) {
+            if (ready->empty()) {
+                continue;
+            }
+            const Request* request = requestAt(ready->begin()->rid);
+            if (!invariant(request != nullptr)) {
+                return nullptr;
+            }
+            const double lateness = normalizedLateness(*request);
+            if (lateness < 0.0) {
+                continue;
+            }
+            if (best == nullptr || lateness > best_lateness ||
+                (lateness == best_lateness &&
+                 std::pair(request->arrival_time, request->rid) <
+                     std::pair(best->arrival_time, best->rid))) {
+                best = request;
+                best_lateness = lateness;
+            }
+        }
+        return best;
     }
 
     static bool atEnd(std::istringstream& input) {
@@ -551,7 +639,10 @@ private:
     }
 
     static ReadyKey readyKey(const Request& request) {
-        return {request.arrival_time, request.rid};
+        const double priority_time = isPrefillStage(request.stage)
+                                         ? request.arrival_time
+                                         : request.decode_ready_time;
+        return {priority_time, request.rid};
     }
 
     void addReady(const Request& request) {
@@ -767,7 +858,7 @@ private:
             return applyArrival(event, timestamp);
         }
         if (event.kind == EventKind::TASK_DONE) {
-            return applyTaskDone(event);
+            return applyTaskDone(event, timestamp);
         }
         if (event.kind == EventKind::TRANSFER_DONE) {
             return applyTransferDone(event);
@@ -787,12 +878,13 @@ private:
             return false;
         }
         requests_[rid] = Request{event.rid, event.input_length, -1,
-                                 RequestStage::READY_P_PRE, timestamp, false};
+                                 RequestStage::READY_P_PRE, timestamp, timestamp,
+                                 false};
         addReady(*requests_[rid]);
         return true;
     }
 
-    bool applyTaskDone(const Event& event) {
+    bool applyTaskDone(const Event& event, double timestamp) {
         if (!validateTaskShape(event.task) ||
             !invariant(event.server == expectedServer(event.task)) ||
             !validateRequests(event.task, runningStageFor(event.task))) {
@@ -819,7 +911,11 @@ private:
 
         const RequestStage next = completedStageFor(event.task);
         for (int rid : event.task.request_ids) {
-            setStage(*requestAt(rid), next);
+            Request* request = requestAt(rid);
+            if (event.task.step == TaskStep::POST) {
+                request->decode_ready_time = timestamp;
+            }
+            setStage(*request, next);
         }
         return true;
     }
@@ -927,8 +1023,12 @@ private:
     std::vector<int> best_decode_pre_batch_;
     std::vector<int> best_decode_proc_batch_;
     std::vector<int> best_decode_post_batch_;
+    std::vector<int> fastest_decode_pre_batch_;
+    std::vector<int> fastest_decode_proc_batch_;
+    std::vector<int> fastest_decode_post_batch_;
 
     std::vector<std::optional<Request>> requests_;
+    double current_time_ = 0.0;
     bool edge_busy_ = false;
     std::vector<bool> remote_busy_;
     std::optional<TaskSpec> edge_task_;
