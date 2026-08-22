@@ -217,7 +217,7 @@ public:
             const ReadySet& prefill = ready_p_proc_[static_cast<std::size_t>(remote)];
             if (!decode.empty()) {
                 task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
-                        {decode.begin()->rid}};
+                        oldestBatch(decode, best_decode_proc_batch_)};
                 found = true;
             } else if (!prefill.empty()) {
                 task = {WorkKind::PREFILL, TaskStep::PROC, remote, 0,
@@ -325,7 +325,7 @@ private:
         long double best_rate = -1.0L;
         int best_size = 1;
         for (int size = 1; size <= kMaxRequests; ++size) {
-            // ponytail: current-ready local throughput only; add transfer-aware
+            // ponytail: current-ready compute throughput only; add transfer-aware
             // planning only after this heuristic is measured on judge data.
             const long double rate =
                 size / (static_cast<long double>(system_.schedule_cost) +
@@ -341,21 +341,27 @@ private:
 
     bool prepareDecodeBatching() {
         TimingCurve decode_pre;
+        TimingCurve decode_proc;
         TimingCurve decode_post;
         for (const TaskTimingRow& row : task_times_) {
             if (row.decode_pre >= 0.0) {
                 decode_pre.emplace_back(row.batch_size, row.decode_pre);
             }
+            if (row.decode_proc >= 0.0) {
+                decode_proc.emplace_back(row.batch_size, row.decode_proc);
+            }
             if (row.decode_post >= 0.0) {
                 decode_post.emplace_back(row.batch_size, row.decode_post);
             }
         }
-        if (decode_pre.empty() || decode_post.empty()) {
+        if (decode_pre.empty() || decode_proc.empty() || decode_post.empty()) {
             return false;
         }
         std::sort(decode_pre.begin(), decode_pre.end());
+        std::sort(decode_proc.begin(), decode_proc.end());
         std::sort(decode_post.begin(), decode_post.end());
         best_decode_pre_batch_ = bestBatchSizes(decode_pre);
+        best_decode_proc_batch_ = bestBatchSizes(decode_proc);
         best_decode_post_batch_ = bestBatchSizes(decode_post);
         return true;
     }
@@ -919,6 +925,7 @@ private:
     ScoringConfig scoring_;
     std::vector<TaskTimingRow> task_times_;
     std::vector<int> best_decode_pre_batch_;
+    std::vector<int> best_decode_proc_batch_;
     std::vector<int> best_decode_post_batch_;
 
     std::vector<std::optional<Request>> requests_;
