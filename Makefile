@@ -7,6 +7,7 @@ scheduler: main.cpp
 .PHONY: test clean
 test: scheduler
 	python3 tests/test_scheduler.py ./scheduler
+	python3 tests/test_simulator.py ./scheduler
 
 clean:
 	$(RM) scheduler

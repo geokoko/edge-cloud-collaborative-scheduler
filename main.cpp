@@ -1,4 +1,5 @@
 #include <bits/stdc++.h>
+#include <cassert>
 
 enum class RequestStage {
     READY_P_PRE,
@@ -66,6 +67,7 @@ struct Request {
     double arrival_time = 0.0;
     double decode_ready_time = 0.0;
     bool finished = false;
+    bool has_produced_token = false;
     int next_prefill_layer = 0;
 };
 
@@ -99,14 +101,15 @@ struct TaskTimingRow {
 };
 
 struct ReadyKey {
+    bool first_token_decode = false;
     double priority_time = 0.0;
     int rid = -1;
 };
 
 struct ReadyKeyLess {
     bool operator()(const ReadyKey& lhs, const ReadyKey& rhs) const {
-        return std::tie(lhs.priority_time, lhs.rid) <
-               std::tie(rhs.priority_time, rhs.rid);
+        return std::tie(lhs.first_token_decode, lhs.priority_time, lhs.rid) <
+               std::tie(rhs.first_token_decode, rhs.priority_time, rhs.rid);
     }
 };
 
@@ -146,7 +149,7 @@ public:
             scoring_.slo2 <= 0.0) {
             return false;
         }
-        if (!prepareDecodeBatching()) {
+        if (!prepareSchedulingData()) {
             return false;
         }
         remote_busy_.assign(static_cast<std::size_t>(system_.remote_count), false);
@@ -223,8 +226,9 @@ public:
             bool found = false;
             const ReadySet& decode = ready_d_proc_[static_cast<std::size_t>(remote)];
             const ReadySet& prefill = ready_p_proc_[static_cast<std::size_t>(remote)];
+            const bool active_decode = frontHasProducedToken(decode);
             if (yield_to_decode_[static_cast<std::size_t>(remote)] &&
-                !decode.empty()) {
+                active_decode) {
                 task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
                         oldestBatch(decode, best_decode_proc_batch_)};
                 found = true;
@@ -233,7 +237,7 @@ public:
                 if (overdue != nullptr &&
                     overdue->stage == RequestStage::READY_P_PROC) {
                     int layer_end = system_.num_layers;
-                    if (!decode.empty() && overdue->next_prefill_layer == 0 &&
+                    if (active_decode && overdue->next_prefill_layer == 0 &&
                         system_.num_layers > 1) {
                         layer_end = (system_.num_layers + 1) / 2;
                     }
@@ -241,7 +245,8 @@ public:
                             overdue->next_prefill_layer, layer_end,
                             {overdue->rid}};
                     found = true;
-                } else if (!decode.empty()) {
+                } else if (!decode.empty() &&
+                           (active_decode || prefill.empty())) {
                     if (prefill.empty() &&
                         shouldDeferBatch(
                             decode, best_decode_proc_batch_,
@@ -279,19 +284,25 @@ public:
 
         if (!edge_busy_) {
             TaskSpec task;
+            const bool active_d_post = frontHasProducedToken(ready_d_post_);
+            const bool active_d_pre = frontHasProducedToken(ready_d_pre_);
             const Request* overdue = mostOverdue(
                 {&ready_d_post_, &ready_p_post_, &ready_d_pre_, &ready_p_pre_});
             std::optional<RequestStage> selected_stage;
             if (overdue != nullptr) {
                 selected_stage = overdue->stage;
-            } else if (!ready_d_post_.empty()) {
+            } else if (active_d_post) {
                 selected_stage = RequestStage::READY_D_POST;
+            } else if (active_d_pre) {
+                selected_stage = RequestStage::READY_D_PRE;
             } else if (!ready_p_post_.empty()) {
                 selected_stage = RequestStage::READY_P_POST;
-            } else if (!ready_d_pre_.empty()) {
-                selected_stage = RequestStage::READY_D_PRE;
             } else if (!ready_p_pre_.empty()) {
                 selected_stage = RequestStage::READY_P_PRE;
+            } else if (!ready_d_post_.empty()) {
+                selected_stage = RequestStage::READY_D_POST;
+            } else if (!ready_d_pre_.empty()) {
+                selected_stage = RequestStage::READY_D_PRE;
             }
 
             if (selected_stage == RequestStage::READY_D_POST) {
@@ -315,15 +326,27 @@ public:
                 task = {WorkKind::DECODE, TaskStep::PRE, -1, -1, -1,
                         oldestBatch(ready_d_pre_, best_decode_pre_batch_)};
             } else if (selected_stage == RequestStage::READY_P_PRE) {
-                const int rid = ready_p_pre_.begin()->rid;
+                const Request* candidate =
+                    overdue != nullptr &&
+                            overdue->stage == RequestStage::READY_P_PRE
+                        ? overdue
+                        : shortestPrefill(ready_p_pre_);
+                if (!invariant(candidate != nullptr)) {
+                    return assignments;
+                }
+                const int rid = candidate->rid;
                 Request* request = requestAt(rid);
                 if (!invariant(request != nullptr && request->remote == -1)) {
                     return assignments;
                 }
-                request->remote = leastLoadedRemote();
-                next_remote_ = (request->remote + 1) % system_.remote_count;
-                task = {WorkKind::PREFILL, TaskStep::PRE, request->remote, -1,
-                        -1, {rid}};
+                if (shouldDeferPrefill(*request)) {
+                    selected_stage.reset();
+                } else {
+                    request->remote = leastLoadedRemote();
+                    next_remote_ = (request->remote + 1) % system_.remote_count;
+                    task = {WorkKind::PREFILL, TaskStep::PRE, request->remote,
+                            -1, -1, {rid}};
+                }
             }
 
             if (selected_stage) {
@@ -389,7 +412,7 @@ private:
         long double best_rate = -1.0L;
         int best_size = 1;
         for (int size = 1; size <= kMaxRequests; ++size) {
-            // ponytail: current-ready compute throughput only; add transfer-aware
+            // Current-ready compute throughput only; add transfer-aware
             // planning only after this heuristic is measured on judge data.
             const long double rate =
                 size / (static_cast<long double>(system_.schedule_cost) +
@@ -403,11 +426,20 @@ private:
         return choices;
     }
 
-    bool prepareDecodeBatching() {
+    bool prepareSchedulingData() {
         TimingCurve decode_pre;
         TimingCurve decode_proc;
         TimingCurve decode_post;
         for (const TaskTimingRow& row : task_times_) {
+            if (row.prefill_pre >= 0.0) {
+                prefill_pre_.emplace_back(row.batch_size, row.prefill_pre);
+            }
+            if (row.prefill_proc >= 0.0) {
+                prefill_proc_.emplace_back(row.batch_size, row.prefill_proc);
+            }
+            if (row.prefill_post >= 0.0) {
+                prefill_post_.emplace_back(row.batch_size, row.prefill_post);
+            }
             if (row.decode_pre >= 0.0) {
                 decode_pre.emplace_back(row.batch_size, row.decode_pre);
             }
@@ -418,9 +450,14 @@ private:
                 decode_post.emplace_back(row.batch_size, row.decode_post);
             }
         }
-        if (decode_pre.empty() || decode_proc.empty() || decode_post.empty()) {
+        if (prefill_pre_.empty() || prefill_proc_.empty() ||
+            prefill_post_.empty() || decode_pre.empty() ||
+            decode_proc.empty() || decode_post.empty()) {
             return false;
         }
+        std::sort(prefill_pre_.begin(), prefill_pre_.end());
+        std::sort(prefill_proc_.begin(), prefill_proc_.end());
+        std::sort(prefill_post_.begin(), prefill_post_.end());
         std::sort(decode_pre.begin(), decode_pre.end());
         std::sort(decode_proc.begin(), decode_proc.end());
         std::sort(decode_post.begin(), decode_post.end());
@@ -447,7 +484,7 @@ private:
     }
 
     int leastLoadedRemote() const {
-        // ponytail: O(R) for each of at most R assignments; maintain counters
+        // O(R) for each of at most R assignments; maintain counters
         // only if the request limit grows beyond 2000.
         std::vector<int> load(static_cast<std::size_t>(system_.remote_count));
         for (const std::optional<Request>& request : requests_) {
@@ -472,14 +509,102 @@ private:
                stage <= RequestStage::RUNNING_P_POST;
     }
 
+    long double transferTime(int token_count) const {
+        return system_.latency_in_ms +
+               8.0L * token_count * system_.bytes_per_token /
+                   (static_cast<long double>(system_.bandwidth_gbps) * 1.0e6L);
+    }
+
+    long double estimatedPrefillTime(const Request& request) const {
+        return 3.0L * system_.schedule_cost +
+               lookupTime(prefill_pre_, request.input_length) +
+               lookupTime(prefill_proc_, request.input_length) +
+               lookupTime(prefill_post_, request.input_length) +
+               2.0L * transferTime(request.input_length);
+    }
+
+    const Request* shortestPrefill(const ReadySet& ready) const {
+        // O(n) per admission is bounded by kMaxRequests; maintain a
+        // second cost-ordered index only if that limit grows substantially.
+        const Request* best = nullptr;
+        long double best_time = 0.0L;
+        for (const ReadyKey& key : ready) {
+            const Request* candidate = requestAt(key.rid);
+            if (!invariant(candidate != nullptr)) {
+                return nullptr;
+            }
+            const long double time = estimatedPrefillTime(*candidate);
+            if (best == nullptr || time < best_time ||
+                (time == best_time &&
+                 std::pair(candidate->arrival_time, candidate->rid) <
+                     std::pair(best->arrival_time, best->rid))) {
+                best = candidate;
+                best_time = time;
+            }
+        }
+        return best;
+    }
+
     double normalizedLateness(const Request& request) const {
-        // ponytail: hard end-to-end deadlines only; add remaining-work slack
-        // estimates only if judge measurements justify prediction complexity.
+        // Starvation guard only: the scorer uses aggregate mean TDR/TPOT, not
+        // per-request deadlines.
         const bool prefill = isPrefillStage(request.stage);
+        if (!prefill && !request.has_produced_token) {
+            return -std::numeric_limits<double>::infinity();
+        }
         const double target = prefill ? scoring_.slo1 : scoring_.slo2;
         const double reference =
             prefill ? request.arrival_time : request.decode_ready_time;
         return (current_time_ - reference - target) / target;
+    }
+
+    bool costlyPrefill(const Request& request) const {
+        const long double transfer = transferTime(request.input_length);
+        const double pre = system_.schedule_cost +
+                           lookupTime(prefill_pre_, request.input_length);
+        const double proc = system_.schedule_cost +
+                            lookupTime(prefill_proc_, request.input_length);
+        const double post = system_.schedule_cost +
+                            lookupTime(prefill_post_, request.input_length);
+        return transfer > scoring_.slo2 || pre > scoring_.slo2 ||
+               proc > scoring_.slo2 || post > scoring_.slo2;
+    }
+
+    bool shouldDeferPrefill(const Request& candidate) const {
+        if (scoring_.throughput_weight != 0.0 ||
+            normalizedLateness(candidate) >= 0.0 ||
+            !costlyPrefill(candidate)) {
+            return false;
+        }
+
+        bool active_decode = false;
+        bool costly_prefill_in_flight = false;
+        bool guaranteed_event = edge_busy_ ||
+                                std::any_of(remote_busy_.begin(),
+                                            remote_busy_.end(),
+                                            [](bool busy) { return busy; });
+        for (const std::optional<Request>& request : requests_) {
+            if (!request || request->finished) {
+                continue;
+            }
+            active_decode |=
+                request->has_produced_token &&
+                request->stage >= RequestStage::READY_D_PRE &&
+                request->stage <= RequestStage::RUNNING_D_POST;
+            costly_prefill_in_flight |=
+                request->stage > RequestStage::READY_P_PRE &&
+                request->stage <= RequestStage::RUNNING_P_POST &&
+                costlyPrefill(*request);
+            guaranteed_event |=
+                request->stage == RequestStage::WAITING_P_UP ||
+                request->stage == RequestStage::WAITING_P_DOWN ||
+                request->stage == RequestStage::WAITING_D_UP ||
+                request->stage == RequestStage::WAITING_D_DOWN;
+        }
+
+        // One costly prefill may overlap decode; raise the cap only
+        // after isolated judge data shows that more link concurrency is useful.
+        return active_decode && costly_prefill_in_flight && guaranteed_event;
     }
 
     const Request* mostOverdue(
@@ -532,7 +657,7 @@ private:
         const std::size_t potential_size =
             std::min(batch_choices.size() - 1,
                      ready.size() + static_cast<std::size_t>(pending));
-        // ponytail: wait for one guaranteed transfer event only; model the
+        // Wait for one guaranteed transfer event only; model the
         // transfer queues if longer lookahead proves worthwhile.
         return batch_choices[potential_size] > batch_choices[ready.size()];
     }
@@ -706,10 +831,19 @@ private:
     }
 
     static ReadyKey readyKey(const Request& request) {
-        const double priority_time = isPrefillStage(request.stage)
-                                         ? request.arrival_time
-                                         : request.decode_ready_time;
-        return {priority_time, request.rid};
+        const bool prefill = isPrefillStage(request.stage);
+        const double priority_time =
+            prefill ? request.arrival_time : request.decode_ready_time;
+        return {!prefill && !request.has_produced_token, priority_time,
+                request.rid};
+    }
+
+    bool frontHasProducedToken(const ReadySet& ready) const {
+        if (ready.empty()) {
+            return false;
+        }
+        const Request* request = requestAt(ready.begin()->rid);
+        return invariant(request != nullptr) && request->has_produced_token;
     }
 
     void addReady(const Request& request) {
@@ -997,6 +1131,8 @@ private:
             }
             if (event.task.step == TaskStep::POST) {
                 request->decode_ready_time = timestamp;
+                request->has_produced_token |=
+                    event.task.work == WorkKind::DECODE;
             }
             setStage(*request, next);
         }
@@ -1103,6 +1239,9 @@ private:
     SystemConfig system_;
     ScoringConfig scoring_;
     std::vector<TaskTimingRow> task_times_;
+    TimingCurve prefill_pre_;
+    TimingCurve prefill_proc_;
+    TimingCurve prefill_post_;
     std::vector<int> best_decode_pre_batch_;
     std::vector<int> best_decode_proc_batch_;
     std::vector<int> best_decode_post_batch_;
