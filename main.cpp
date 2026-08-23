@@ -152,6 +152,8 @@ public:
         remote_busy_.assign(static_cast<std::size_t>(system_.remote_count), false);
         yield_to_decode_.assign(static_cast<std::size_t>(system_.remote_count),
                                 false);
+        deferred_d_proc_.assign(static_cast<std::size_t>(system_.remote_count),
+                                false);
         remote_tasks_.resize(static_cast<std::size_t>(system_.remote_count));
         ready_p_proc_.resize(static_cast<std::size_t>(system_.remote_count));
         ready_d_proc_.resize(static_cast<std::size_t>(system_.remote_count));
@@ -240,9 +242,18 @@ public:
                             {overdue->rid}};
                     found = true;
                 } else if (!decode.empty()) {
-                    task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
-                            oldestBatch(decode, best_decode_proc_batch_)};
-                    found = true;
+                    if (prefill.empty() &&
+                        shouldDeferBatch(
+                            decode, best_decode_proc_batch_,
+                            RequestStage::WAITING_D_UP, remote,
+                            deferred_d_proc_[static_cast<std::size_t>(remote)])) {
+                        deferred_d_proc_[static_cast<std::size_t>(remote)] = true;
+                    } else {
+                        task = {WorkKind::DECODE, TaskStep::PROC, remote, -1,
+                                -1,
+                                oldestBatch(decode, best_decode_proc_batch_)};
+                        found = true;
+                    }
                 } else if (!prefill.empty()) {
                     const Request* request = requestAt(prefill.begin()->rid);
                     if (!invariant(request != nullptr)) {
@@ -261,6 +272,7 @@ public:
                     return assignments;
                 }
                 yield_to_decode_[static_cast<std::size_t>(remote)] = false;
+                deferred_d_proc_[static_cast<std::size_t>(remote)] = false;
                 assignments.push_back(std::move(assignment));
             }
         }
@@ -283,8 +295,18 @@ public:
             }
 
             if (selected_stage == RequestStage::READY_D_POST) {
-                task = {WorkKind::DECODE, TaskStep::POST, -1, -1, -1,
-                        oldestBatch(ready_d_post_, best_decode_post_batch_)};
+                if (ready_p_post_.empty() && ready_d_pre_.empty() &&
+                    ready_p_pre_.empty() &&
+                    shouldDeferBatch(ready_d_post_, best_decode_post_batch_,
+                                     RequestStage::WAITING_D_DOWN, -1,
+                                     deferred_d_post_)) {
+                    deferred_d_post_ = true;
+                    selected_stage.reset();
+                } else {
+                    task = {WorkKind::DECODE, TaskStep::POST, -1, -1, -1,
+                            oldestBatch(ready_d_post_,
+                                        best_decode_post_batch_)};
+                }
             } else if (selected_stage == RequestStage::READY_P_POST) {
                 const int rid = ready_p_post_.begin()->rid;
                 task = {WorkKind::PREFILL, TaskStep::POST,
@@ -309,6 +331,7 @@ public:
                 if (!startAssignment(assignment)) {
                     return assignments;
                 }
+                deferred_d_post_ = false;
                 assignments.push_back(std::move(assignment));
             }
         }
@@ -484,6 +507,34 @@ private:
             }
         }
         return best;
+    }
+
+    int pendingCount(RequestStage stage, int remote) const {
+        int count = 0;
+        for (const std::optional<Request>& request : requests_) {
+            if (request && !request->finished && request->stage == stage &&
+                (remote < 0 || request->remote == remote)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    bool shouldDeferBatch(const ReadySet& ready,
+                          const std::vector<int>& batch_choices,
+                          RequestStage pending_stage, int remote,
+                          bool already_deferred) const {
+        if (already_deferred || ready.empty() ||
+            mostOverdue({&ready}) != nullptr) {
+            return false;
+        }
+        const int pending = pendingCount(pending_stage, remote);
+        const std::size_t potential_size =
+            std::min(batch_choices.size() - 1,
+                     ready.size() + static_cast<std::size_t>(pending));
+        // ponytail: wait for one guaranteed transfer event only; model the
+        // transfer queues if longer lookahead proves worthwhile.
+        return batch_choices[potential_size] > batch_choices[ready.size()];
     }
 
     static bool atEnd(std::istringstream& input) {
@@ -1061,6 +1112,8 @@ private:
     bool edge_busy_ = false;
     std::vector<bool> remote_busy_;
     std::vector<bool> yield_to_decode_;
+    std::vector<bool> deferred_d_proc_;
+    bool deferred_d_post_ = false;
     std::optional<TaskSpec> edge_task_;
     std::vector<std::optional<TaskSpec>> remote_tasks_;
     int next_remote_ = 0;
