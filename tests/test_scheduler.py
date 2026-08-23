@@ -411,6 +411,110 @@ def main() -> int:
 
     run_case(
         binary,
+        "least-loaded remote assignment with round-robin ties",
+        clean(
+            """
+            2 1.000000000 0.100000000 100.000000000 100 1
+            1000.000000000 1000.000000000 1.000000000 0.000000000 0.000000000 0.500000000 0.500000000
+            2
+            1 1.000000000 1.000000000 3.000000000 1.000000000 1.000000000 1.000000000
+            2 1.000000000 100.000000000 3.000000000 1.000000000 1.000000000 1.000000000
+            0.000000000
+            3
+            ARR 0 1
+            ARR 1 2
+            ARR 2 1
+            2.000000000
+            1
+            TDN E P PRE 0 0 1.000000000
+            2.100000000
+            1
+            XDN UP 0 100 PRE 1 0
+            4.000000000
+            1
+            TDN E P PRE 1 1 1.000000000
+            4.100000000
+            2
+            TDN C0 P PROC 0 1 0 0 1.000000000
+            XDN UP 1 200 PRE 1 1
+            4.200000000
+            1
+            XDN DOWN 0 100 PRE 1 0
+            6.000000000
+            1
+            TDN E P PRE 0 2 1.000000000
+            6.100000000
+            1
+            XDN UP 0 100 PRE 1 2
+            8.100000000
+            1
+            TDN C0 P PROC 0 1 0 2 1.000000000
+            8.200000000
+            1
+            XDN DOWN 0 100 PRE 1 2
+            10.000000000
+            1
+            TDN E P POST 0 0 3.000000000
+            14.000000000
+            1
+            TDN E P POST 0 2 3.000000000
+            16.000000000
+            1
+            TDN E D PRE -1 2 0 2 1.000000000
+            16.100000000
+            1
+            XDN UP 0 200 DEC 2 0 2
+            18.100000000
+            1
+            TDN C0 D PROC 0 2 0 2 1.000000000
+            18.200000000
+            1
+            XDN DOWN 0 200 DEC 2 0 2
+            20.200000000
+            4
+            TDN E D POST -1 2 0 2 1.000000000
+            FIN 0
+            FIN 2
+            ARR 3 1
+            """
+        ),
+        clean(
+            """
+            1
+            E P PRE 0 0
+            1
+            E P PRE 1 1
+            1
+            C0 P PROC 0 1 0 0
+            1
+            E P PRE 0 2
+            1
+            C1 P PROC 0 1 1 1
+            0
+            1
+            E P POST 0 0
+            1
+            C0 P PROC 0 1 0 2
+            0
+            0
+            1
+            E P POST 0 2
+            1
+            E D PRE -1 2 0 2
+            0
+            1
+            C0 D PROC 0 2 0 2
+            0
+            1
+            E D POST -1 2 0 2
+            1
+            E P PRE 0 3
+            """
+        ),
+    )
+
+    run_case(
+        binary,
         "deadline aging prevents local and remote prefill starvation",
         clean(
             """
@@ -558,7 +662,7 @@ def main() -> int:
         ),
     )
 
-    print("5 scheduler regression cases passed")
+    print("6 scheduler regression cases passed")
     return 0
 
 

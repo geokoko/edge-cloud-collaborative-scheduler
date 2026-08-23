@@ -276,8 +276,8 @@ public:
                 if (!invariant(request != nullptr && request->remote == -1)) {
                     return assignments;
                 }
-                request->remote = next_remote_;
-                next_remote_ = (next_remote_ + 1) % system_.remote_count;
+                request->remote = leastLoadedRemote();
+                next_remote_ = (request->remote + 1) % system_.remote_count;
                 task = {WorkKind::PREFILL, TaskStep::PRE, request->remote, -1,
                         -1, {rid}};
             }
@@ -399,6 +399,27 @@ private:
             request_ids.push_back(it->rid);
         }
         return request_ids;
+    }
+
+    int leastLoadedRemote() const {
+        // ponytail: O(R) for each of at most R assignments; maintain counters
+        // only if the request limit grows beyond 2000.
+        std::vector<int> load(static_cast<std::size_t>(system_.remote_count));
+        for (const std::optional<Request>& request : requests_) {
+            if (request && !request->finished && request->remote >= 0) {
+                ++load[static_cast<std::size_t>(request->remote)];
+            }
+        }
+
+        int best = next_remote_;
+        for (int offset = 1; offset < system_.remote_count; ++offset) {
+            const int remote = (next_remote_ + offset) % system_.remote_count;
+            if (load[static_cast<std::size_t>(remote)] <
+                load[static_cast<std::size_t>(best)]) {
+                best = remote;
+            }
+        }
+        return best;
     }
 
     static bool isPrefillStage(RequestStage stage) {
