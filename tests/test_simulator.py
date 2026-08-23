@@ -219,6 +219,24 @@ def test_overdue_prefill_beats_shorter_new_arrival(binary):
     check_invariants(result)
 
 
+def test_score_scaled_aging_keeps_shortest_prefill(binary):
+    rows = [(1, 20.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+            (8, 20.0, 80.0, 8.0, 1.0, 1.0, 1.0)]
+    result = simulate(scenario(num_layers=1, rows=rows,
+                               bytes_per_token=1, slo1=10.0, slo2=1000.0,
+                               dist_base=100.0,
+                               arrivals=[(0.0, 1, 1), (1.0, 8, 1),
+                                         (18.0, 1, 1)]), [binary])
+    check(result.ok, f"score-scaled aging run failed: {result.error}")
+    starts = [line for line in result.responses.splitlines()
+              if line.startswith("E P PRE")]
+    check(starts == ["E P PRE 0 0", "E P PRE 0 2", "E P PRE 0 1"],
+          f"a large distance budget should retain shortest-first order: {starts}")
+    check(result.tdr < 90.0,
+          f"short-first should keep mean TDR below 90ms, got {result.tdr}")
+    check_invariants(result)
+
+
 def test_uplink_queues_behind_a_transfer_in_flight(binary):
     # 1 token = 10ms latency + 8ms of bits = 18ms on the wire, while P PRE
     # takes only S+1 = 2ms, so the second uplink must queue behind the first.
@@ -378,6 +396,7 @@ def main():
                     test_one_token_request_has_no_gap,
                     test_shortest_prefill_is_admitted_first,
                     test_overdue_prefill_beats_shorter_new_arrival,
+                    test_score_scaled_aging_keeps_shortest_prefill,
                     test_uplink_queues_behind_a_transfer_in_flight,
                     test_decode_group_splits_by_remote]
     for case in cases:

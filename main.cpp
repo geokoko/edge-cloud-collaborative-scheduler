@@ -328,7 +328,9 @@ public:
             } else if (selected_stage == RequestStage::READY_P_PRE) {
                 const Request* candidate =
                     overdue != nullptr &&
-                            overdue->stage == RequestStage::READY_P_PRE
+                            overdue->stage == RequestStage::READY_P_PRE &&
+                            normalizedLateness(*overdue) >=
+                                std::max(1.0, scoring_.distance_base)
                         ? overdue
                         : shortestPrefill(ready_p_pre_);
                 if (!invariant(candidate != nullptr)) {
