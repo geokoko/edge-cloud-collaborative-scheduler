@@ -225,11 +225,8 @@ public:
                         system_.num_layers, {overdue->rid}};
                 found = true;
             } else if (!decode.empty()) {
-                const std::vector<int>& batch_sizes =
-                    overdue != nullptr ? fastest_decode_proc_batch_
-                                       : best_decode_proc_batch_;
                 task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
-                        oldestBatch(decode, batch_sizes)};
+                        oldestBatch(decode, best_decode_proc_batch_)};
                 found = true;
             } else if (!prefill.empty()) {
                 task = {WorkKind::PREFILL, TaskStep::PROC, remote, 0,
@@ -264,21 +261,15 @@ public:
             }
 
             if (selected_stage == RequestStage::READY_D_POST) {
-                const std::vector<int>& batch_sizes =
-                    overdue != nullptr ? fastest_decode_post_batch_
-                                       : best_decode_post_batch_;
                 task = {WorkKind::DECODE, TaskStep::POST, -1, -1, -1,
-                        oldestBatch(ready_d_post_, batch_sizes)};
+                        oldestBatch(ready_d_post_, best_decode_post_batch_)};
             } else if (selected_stage == RequestStage::READY_P_POST) {
                 const int rid = ready_p_post_.begin()->rid;
                 task = {WorkKind::PREFILL, TaskStep::POST,
                         requestAt(rid)->remote, -1, -1, {rid}};
             } else if (selected_stage == RequestStage::READY_D_PRE) {
-                const std::vector<int>& batch_sizes =
-                    overdue != nullptr ? fastest_decode_pre_batch_
-                                       : best_decode_pre_batch_;
                 task = {WorkKind::DECODE, TaskStep::PRE, -1, -1, -1,
-                        oldestBatch(ready_d_pre_, batch_sizes)};
+                        oldestBatch(ready_d_pre_, best_decode_pre_batch_)};
             } else if (selected_stage == RequestStage::READY_P_PRE) {
                 const int rid = ready_p_pre_.begin()->rid;
                 Request* request = requestAt(rid);
@@ -367,21 +358,6 @@ private:
         return choices;
     }
 
-    static std::vector<int> fastestBatchSizes(const TimingCurve& curve) {
-        std::vector<int> choices(kMaxRequests + 1, 1);
-        double best_time = std::numeric_limits<double>::infinity();
-        int best_size = 1;
-        for (int size = 1; size <= kMaxRequests; ++size) {
-            const double time = lookupTime(curve, size);
-            if (time < best_time) {
-                best_time = time;
-                best_size = size;
-            }
-            choices[static_cast<std::size_t>(size)] = best_size;
-        }
-        return choices;
-    }
-
     bool prepareDecodeBatching() {
         TimingCurve decode_pre;
         TimingCurve decode_proc;
@@ -406,9 +382,6 @@ private:
         best_decode_pre_batch_ = bestBatchSizes(decode_pre);
         best_decode_proc_batch_ = bestBatchSizes(decode_proc);
         best_decode_post_batch_ = bestBatchSizes(decode_post);
-        fastest_decode_pre_batch_ = fastestBatchSizes(decode_pre);
-        fastest_decode_proc_batch_ = fastestBatchSizes(decode_proc);
-        fastest_decode_post_batch_ = fastestBatchSizes(decode_post);
         return true;
     }
 
@@ -1023,9 +996,6 @@ private:
     std::vector<int> best_decode_pre_batch_;
     std::vector<int> best_decode_proc_batch_;
     std::vector<int> best_decode_post_batch_;
-    std::vector<int> fastest_decode_pre_batch_;
-    std::vector<int> fastest_decode_proc_batch_;
-    std::vector<int> fastest_decode_post_batch_;
 
     std::vector<std::optional<Request>> requests_;
     double current_time_ = 0.0;

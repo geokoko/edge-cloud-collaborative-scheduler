@@ -483,35 +483,26 @@ def main() -> int:
             TDN E P POST 0 2 1.000000000
             43.000000000
             2
-            TDN C0 D PROC 0 1 0 1.000000000
+            TDN C0 D PROC 0 2 0 1 1.000000000
             TDN E D PRE -1 1 2 1.000000000
             44.000000000
             1
             XDN UP 0 100 DEC 1 2
             45.000000000
             1
-            XDN DOWN 0 100 DEC 1 0
+            XDN DOWN 0 200 DEC 2 0 1
             46.000000000
             1
-            TDN C0 D PROC 0 1 1 1.000000000
+            TDN C0 D PROC 0 1 2 1.000000000
             47.000000000
             1
-            XDN DOWN 0 100 DEC 1 1
-            48.000000000
-            2
-            FIN 0
-            TDN E D POST -1 1 0 1.000000000
-            49.000000000
-            1
-            TDN C0 D PROC 0 1 2 1.000000000
-            50.000000000
-            1
             XDN DOWN 0 100 DEC 1 2
-            51.000000000
-            2
-            TDN E D POST -1 1 1 1.000000000
+            48.000000000
+            3
+            FIN 0
+            TDN E D POST -1 2 0 1 1.000000000
             FIN 1
-            52.000000000
+            49.000000000
             2
             TDN E D POST -1 1 2 1.000000000
             FIN 2
@@ -548,21 +539,16 @@ def main() -> int:
             0
             0
             1
-            C0 D PROC 0 1 0
+            C0 D PROC 0 2 0 1
             1
             E P POST 0 2
             1
             E D PRE -1 1 2
-            1
-            C0 D PROC 0 1 1
             0
-            1
-            E D POST -1 1 0
             1
             C0 D PROC 0 1 2
-            0
             1
-            E D POST -1 1 1
+            E D POST -1 2 0 1
             0
             0
             1
