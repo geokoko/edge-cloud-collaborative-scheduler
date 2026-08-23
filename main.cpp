@@ -66,6 +66,7 @@ struct Request {
     double arrival_time = 0.0;
     double decode_ready_time = 0.0;
     bool finished = false;
+    int next_prefill_layer = 0;
 };
 
 struct SystemConfig {
@@ -149,6 +150,8 @@ public:
             return false;
         }
         remote_busy_.assign(static_cast<std::size_t>(system_.remote_count), false);
+        yield_to_decode_.assign(static_cast<std::size_t>(system_.remote_count),
+                                false);
         remote_tasks_.resize(static_cast<std::size_t>(system_.remote_count));
         ready_p_proc_.resize(static_cast<std::size_t>(system_.remote_count));
         ready_d_proc_.resize(static_cast<std::size_t>(system_.remote_count));
@@ -218,20 +221,38 @@ public:
             bool found = false;
             const ReadySet& decode = ready_d_proc_[static_cast<std::size_t>(remote)];
             const ReadySet& prefill = ready_p_proc_[static_cast<std::size_t>(remote)];
-            const Request* overdue = mostOverdue({&decode, &prefill});
-            if (overdue != nullptr &&
-                overdue->stage == RequestStage::READY_P_PROC) {
-                task = {WorkKind::PREFILL, TaskStep::PROC, remote, 0,
-                        system_.num_layers, {overdue->rid}};
-                found = true;
-            } else if (!decode.empty()) {
+            if (yield_to_decode_[static_cast<std::size_t>(remote)] &&
+                !decode.empty()) {
                 task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
                         oldestBatch(decode, best_decode_proc_batch_)};
                 found = true;
-            } else if (!prefill.empty()) {
-                task = {WorkKind::PREFILL, TaskStep::PROC, remote, 0,
-                        system_.num_layers, {prefill.begin()->rid}};
-                found = true;
+            } else {
+                const Request* overdue = mostOverdue({&decode, &prefill});
+                if (overdue != nullptr &&
+                    overdue->stage == RequestStage::READY_P_PROC) {
+                    int layer_end = system_.num_layers;
+                    if (!decode.empty() && overdue->next_prefill_layer == 0 &&
+                        system_.num_layers > 1) {
+                        layer_end = (system_.num_layers + 1) / 2;
+                    }
+                    task = {WorkKind::PREFILL, TaskStep::PROC, remote,
+                            overdue->next_prefill_layer, layer_end,
+                            {overdue->rid}};
+                    found = true;
+                } else if (!decode.empty()) {
+                    task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
+                            oldestBatch(decode, best_decode_proc_batch_)};
+                    found = true;
+                } else if (!prefill.empty()) {
+                    const Request* request = requestAt(prefill.begin()->rid);
+                    if (!invariant(request != nullptr)) {
+                        return assignments;
+                    }
+                    task = {WorkKind::PREFILL, TaskStep::PROC, remote,
+                            request->next_prefill_layer, system_.num_layers,
+                            {request->rid}};
+                    found = true;
+                }
             }
 
             if (found) {
@@ -239,6 +260,7 @@ public:
                 if (!startAssignment(assignment)) {
                     return assignments;
                 }
+                yield_to_decode_[static_cast<std::size_t>(remote)] = false;
                 assignments.push_back(std::move(assignment));
             }
         }
@@ -745,13 +767,15 @@ private:
         return RequestStage::RUNNING_D_POST;
     }
 
-    static RequestStage completedStageFor(const TaskSpec& task) {
+    RequestStage completedStageFor(const TaskSpec& task) const {
         if (task.work == WorkKind::PREFILL) {
             if (task.step == TaskStep::PRE) {
                 return RequestStage::WAITING_P_UP;
             }
             if (task.step == TaskStep::PROC) {
-                return RequestStage::WAITING_P_DOWN;
+                return task.layer_end == system_.num_layers
+                           ? RequestStage::WAITING_P_DOWN
+                           : RequestStage::READY_P_PROC;
             }
             return RequestStage::READY_D_PRE;
         }
@@ -784,8 +808,9 @@ private:
                 return false;
             }
             if (task.step == TaskStep::PROC) {
-                return invariant(task.layer_start == 0 &&
-                                 task.layer_end == system_.num_layers);
+                return invariant(task.layer_start >= 0 &&
+                                 task.layer_start < task.layer_end &&
+                                 task.layer_end <= system_.num_layers);
             }
             return invariant(task.layer_start == -1 && task.layer_end == -1);
         }
@@ -809,6 +834,11 @@ private:
             if ((task.work == WorkKind::PREFILL ||
                  task.step == TaskStep::PROC) &&
                 !invariant(request->remote == task.remote)) {
+                return false;
+            }
+            if (task.work == WorkKind::PREFILL &&
+                task.step == TaskStep::PROC &&
+                !invariant(request->next_prefill_layer == task.layer_start)) {
                 return false;
             }
         }
@@ -906,6 +936,14 @@ private:
         const RequestStage next = completedStageFor(event.task);
         for (int rid : event.task.request_ids) {
             Request* request = requestAt(rid);
+            if (event.task.work == WorkKind::PREFILL &&
+                event.task.step == TaskStep::PROC) {
+                request->next_prefill_layer = event.task.layer_end;
+                if (event.task.layer_end < system_.num_layers) {
+                    yield_to_decode_[static_cast<std::size_t>(event.task.remote)] =
+                        true;
+                }
+            }
             if (event.task.step == TaskStep::POST) {
                 request->decode_ready_time = timestamp;
             }
@@ -1022,6 +1060,7 @@ private:
     double current_time_ = 0.0;
     bool edge_busy_ = false;
     std::vector<bool> remote_busy_;
+    std::vector<bool> yield_to_decode_;
     std::optional<TaskSpec> edge_task_;
     std::vector<std::optional<TaskSpec>> remote_tasks_;
     int next_remote_ = 0;

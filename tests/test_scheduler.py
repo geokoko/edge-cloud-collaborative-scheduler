@@ -515,6 +515,119 @@ def main() -> int:
 
     run_case(
         binary,
+        "contended prefill splits once and yields to decode",
+        clean(
+            """
+            1 1.000000000 2.000000000 1.000000000 100 4
+            5.000000000 5.000000000 1.000000000 0.000000000 0.000000000 0.500000000 0.500000000
+            2
+            1 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000
+            2 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000 1.000000000
+            0.000000000
+            2
+            ARR 0 1
+            ARR 1 1
+            1.000000000
+            1
+            TDN E P PRE 0 0 1.000000000
+            2.000000000
+            1
+            XDN UP 0 100 PRE 1 0
+            3.000000000
+            1
+            TDN E P PRE 0 1 1.000000000
+            4.000000000
+            2
+            TDN C0 P PROC 0 4 0 0 1.000000000
+            XDN UP 0 100 PRE 1 1
+            5.000000000
+            1
+            XDN DOWN 0 100 PRE 1 0
+            10.000000000
+            1
+            ARR 2 1
+            20.000000000
+            1
+            TDN E P POST 0 0 1.000000000
+            21.000000000
+            1
+            TDN E P PRE 0 2 1.000000000
+            22.000000000
+            1
+            TDN E D PRE -1 1 0 1.000000000
+            23.000000000
+            1
+            XDN UP 0 100 PRE 1 2
+            24.000000000
+            1
+            XDN UP 0 100 DEC 1 0
+            30.000000000
+            1
+            TDN C0 P PROC 0 4 0 1 1.000000000
+            31.500000000
+            1
+            TDN C0 P PROC 0 2 0 2 0.500000000
+            32.000800000
+            1
+            XDN DOWN 0 100 PRE 1 1
+            33.500000000
+            1
+            TDN C0 D PROC 0 1 0 1.000000000
+            34.000800000
+            1
+            TDN E P POST 0 1 1.000000000
+            35.000000000
+            1
+            TDN C0 P PROC 2 4 0 2 0.500000000
+            36.000800000
+            1
+            TDN E D PRE -1 1 1 1.000000000
+            37.000800000
+            1
+            XDN DOWN 0 100 PRE 1 2
+            """
+        ),
+        clean(
+            """
+            1
+            E P PRE 0 0
+            1
+            E P PRE 0 1
+            1
+            C0 P PROC 0 4 0 0
+            0
+            1
+            C0 P PROC 0 4 0 1
+            1
+            E P POST 0 0
+            0
+            1
+            E P PRE 0 2
+            1
+            E D PRE -1 1 0
+            0
+            0
+            0
+            1
+            C0 P PROC 0 2 0 2
+            1
+            C0 D PROC 0 1 0
+            1
+            E P POST 0 1
+            1
+            C0 P PROC 2 4 0 2
+            1
+            E D PRE -1 1 1
+            0
+            0
+            1
+            E P POST 0 2
+            """
+        ),
+    )
+
+    run_case(
+        binary,
         "deadline aging prevents local and remote prefill starvation",
         clean(
             """
@@ -662,7 +775,7 @@ def main() -> int:
         ),
     )
 
-    print("6 scheduler regression cases passed")
+    print("7 scheduler regression cases passed")
     return 0
 
 
