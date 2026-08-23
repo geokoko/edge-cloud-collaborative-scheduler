@@ -58,6 +58,14 @@ struct Event {
     std::vector<int> request_ids;
 };
 
+struct QueuedTransfer {
+    TransferKind kind = TransferKind::PREFILL;
+    int remote = -1;
+    std::int64_t size = 0;
+    std::vector<int> request_ids;
+    double expected_finish_time = 0.0;
+};
+
 struct Request {
     int rid = -1;
     int input_length = 0;
@@ -142,21 +150,29 @@ public:
         }
 
         if (system_.remote_count <= 0 || system_.num_layers <= 0 ||
-            system_.bytes_per_token <= 0 || scoring_.slo1 <= 0.0 ||
+            system_.bytes_per_token <= 0 || system_.latency_in_ms <= 0.0 ||
+            system_.bandwidth_gbps <= 0.0 || scoring_.slo1 <= 0.0 ||
             scoring_.slo2 <= 0.0) {
             return false;
         }
-        if (!prepareDecodeBatching()) {
+        if (!prepareTimingModel()) {
             return false;
         }
-        remote_busy_.assign(static_cast<std::size_t>(system_.remote_count), false);
+        const std::size_t remote_count =
+            static_cast<std::size_t>(system_.remote_count);
+        remote_busy_.assign(remote_count, false);
         yield_to_decode_.assign(static_cast<std::size_t>(system_.remote_count),
                                 false);
-        deferred_d_proc_.assign(static_cast<std::size_t>(system_.remote_count),
-                                false);
-        remote_tasks_.resize(static_cast<std::size_t>(system_.remote_count));
-        ready_p_proc_.resize(static_cast<std::size_t>(system_.remote_count));
-        ready_d_proc_.resize(static_cast<std::size_t>(system_.remote_count));
+        deferred_d_proc_.assign(remote_count, false);
+        remote_tasks_.resize(remote_count);
+        ready_p_proc_.resize(remote_count);
+        ready_d_proc_.resize(remote_count);
+        active_remote_requests_.assign(remote_count, 0);
+        decode_active_by_remote_.assign(remote_count, 0);
+        waiting_d_up_.assign(remote_count, 0);
+        waiting_d_down_.assign(remote_count, 0);
+        ready_d_pre_by_remote_.assign(remote_count, 0);
+        decode_up_finishes_.resize(remote_count);
         input_.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
         return true;
     }
@@ -312,8 +328,13 @@ public:
                 task = {WorkKind::PREFILL, TaskStep::POST,
                         requestAt(rid)->remote, -1, -1, {rid}};
             } else if (selected_stage == RequestStage::READY_D_PRE) {
+                const int transfer_count =
+                    std::max(1, ready_d_pre_remote_count_);
                 task = {WorkKind::DECODE, TaskStep::PRE, -1, -1, -1,
-                        oldestBatch(ready_d_pre_, best_decode_pre_batch_)};
+                        oldestBatch(
+                            ready_d_pre_,
+                            best_decode_pre_batch_[static_cast<std::size_t>(
+                                transfer_count)])};
             } else if (selected_stage == RequestStage::READY_P_PRE) {
                 const int rid = ready_p_pre_.begin()->rid;
                 Request* request = requestAt(rid);
@@ -384,16 +405,36 @@ private:
         return lower->second + position * (upper->second - lower->second);
     }
 
-    std::vector<int> bestBatchSizes(const TimingCurve& curve) const {
+    double transferServiceTime(int token_count, int transfer_count = 1) const {
+        if (transfer_count == 0) {
+            return 0.0;
+        }
+        const long double bytes =
+            static_cast<long double>(token_count) * system_.bytes_per_token;
+        const long double serialization_ms =
+            8.0L * bytes / (system_.bandwidth_gbps * 1'000'000.0L);
+        return transfer_count * system_.latency_in_ms +
+               static_cast<double>(serialization_ms);
+    }
+
+    double transferServiceTimeBytes(std::int64_t size) const {
+        const long double serialization_ms =
+            8.0L * size / (system_.bandwidth_gbps * 1'000'000.0L);
+        return system_.latency_in_ms +
+               static_cast<double>(serialization_ms);
+    }
+
+    std::vector<int> bestBatchSizes(const TimingCurve& curve,
+                                    int transfer_count) const {
         std::vector<int> choices(kMaxRequests + 1, 1);
         long double best_rate = -1.0L;
         int best_size = 1;
         for (int size = 1; size <= kMaxRequests; ++size) {
-            // ponytail: current-ready compute throughput only; add transfer-aware
-            // planning only after this heuristic is measured on judge data.
+            const int actual_transfers = std::min(size, transfer_count);
             const long double rate =
                 size / (static_cast<long double>(system_.schedule_cost) +
-                        lookupTime(curve, size));
+                        lookupTime(curve, size) +
+                        transferServiceTime(size, actual_transfers));
             if (rate > best_rate) {
                 best_rate = rate;
                 best_size = size;
@@ -403,30 +444,51 @@ private:
         return choices;
     }
 
-    bool prepareDecodeBatching() {
-        TimingCurve decode_pre;
-        TimingCurve decode_proc;
-        TimingCurve decode_post;
+    bool prepareTimingModel() {
         for (const TaskTimingRow& row : task_times_) {
+            if (row.prefill_pre >= 0.0) {
+                prefill_pre_curve_.emplace_back(row.batch_size,
+                                                row.prefill_pre);
+            }
+            if (row.prefill_proc >= 0.0) {
+                prefill_proc_curve_.emplace_back(row.batch_size,
+                                                 row.prefill_proc);
+            }
+            if (row.prefill_post >= 0.0) {
+                prefill_post_curve_.emplace_back(row.batch_size,
+                                                 row.prefill_post);
+            }
             if (row.decode_pre >= 0.0) {
-                decode_pre.emplace_back(row.batch_size, row.decode_pre);
+                decode_pre_curve_.emplace_back(row.batch_size, row.decode_pre);
             }
             if (row.decode_proc >= 0.0) {
-                decode_proc.emplace_back(row.batch_size, row.decode_proc);
+                decode_proc_curve_.emplace_back(row.batch_size,
+                                                row.decode_proc);
             }
             if (row.decode_post >= 0.0) {
-                decode_post.emplace_back(row.batch_size, row.decode_post);
+                decode_post_curve_.emplace_back(row.batch_size,
+                                                row.decode_post);
             }
         }
-        if (decode_pre.empty() || decode_proc.empty() || decode_post.empty()) {
+        std::array<TimingCurve*, 6> curves = {
+            &prefill_pre_curve_, &prefill_proc_curve_, &prefill_post_curve_,
+            &decode_pre_curve_,  &decode_proc_curve_,  &decode_post_curve_};
+        if (std::any_of(curves.begin(), curves.end(),
+                        [](const TimingCurve* curve) { return curve->empty(); })) {
             return false;
         }
-        std::sort(decode_pre.begin(), decode_pre.end());
-        std::sort(decode_proc.begin(), decode_proc.end());
-        std::sort(decode_post.begin(), decode_post.end());
-        best_decode_pre_batch_ = bestBatchSizes(decode_pre);
-        best_decode_proc_batch_ = bestBatchSizes(decode_proc);
-        best_decode_post_batch_ = bestBatchSizes(decode_post);
+        for (TimingCurve* curve : curves) {
+            std::sort(curve->begin(), curve->end());
+        }
+
+        best_decode_pre_batch_.resize(
+            static_cast<std::size_t>(system_.remote_count + 1));
+        for (int transfers = 1; transfers <= system_.remote_count; ++transfers) {
+            best_decode_pre_batch_[static_cast<std::size_t>(transfers)] =
+                bestBatchSizes(decode_pre_curve_, transfers);
+        }
+        best_decode_proc_batch_ = bestBatchSizes(decode_proc_curve_, 1);
+        best_decode_post_batch_ = bestBatchSizes(decode_post_curve_, 0);
         return true;
     }
 
@@ -447,20 +509,11 @@ private:
     }
 
     int leastLoadedRemote() const {
-        // ponytail: O(R) for each of at most R assignments; maintain counters
-        // only if the request limit grows beyond 2000.
-        std::vector<int> load(static_cast<std::size_t>(system_.remote_count));
-        for (const std::optional<Request>& request : requests_) {
-            if (request && !request->finished && request->remote >= 0) {
-                ++load[static_cast<std::size_t>(request->remote)];
-            }
-        }
-
         int best = next_remote_;
         for (int offset = 1; offset < system_.remote_count; ++offset) {
             const int remote = (next_remote_ + offset) % system_.remote_count;
-            if (load[static_cast<std::size_t>(remote)] <
-                load[static_cast<std::size_t>(best)]) {
+            if (active_remote_requests_[static_cast<std::size_t>(remote)] <
+                active_remote_requests_[static_cast<std::size_t>(best)]) {
                 best = remote;
             }
         }
@@ -472,9 +525,16 @@ private:
                stage <= RequestStage::RUNNING_P_POST;
     }
 
+    static bool isDecodeStage(RequestStage stage) {
+        return stage >= RequestStage::READY_D_PRE &&
+               stage <= RequestStage::RUNNING_D_POST;
+    }
+
+    double taskOccupancy(const TimingCurve& curve, int size) const {
+        return system_.schedule_cost + lookupTime(curve, size);
+    }
+
     double normalizedLateness(const Request& request) const {
-        // ponytail: hard end-to-end deadlines only; add remaining-work slack
-        // estimates only if judge measurements justify prediction complexity.
         const bool prefill = isPrefillStage(request.stage);
         const double target = prefill ? scoring_.slo1 : scoring_.slo2;
         const double reference =
@@ -510,14 +570,46 @@ private:
     }
 
     int pendingCount(RequestStage stage, int remote) const {
-        int count = 0;
-        for (const std::optional<Request>& request : requests_) {
-            if (request && !request->finished && request->stage == stage &&
-                (remote < 0 || request->remote == remote)) {
-                ++count;
+        if (stage == RequestStage::WAITING_D_UP) {
+            if (!invariant(remote >= 0 && remote < system_.remote_count)) {
+                return 0;
             }
+            return waiting_d_up_[static_cast<std::size_t>(remote)];
         }
-        return count;
+        if (!invariant(stage == RequestStage::WAITING_D_DOWN)) {
+            return 0;
+        }
+        return remote < 0
+                   ? waiting_d_down_total_
+                   : waiting_d_down_[static_cast<std::size_t>(remote)];
+    }
+
+    std::optional<double> nextDecodeTransferFinish(Direction direction,
+                                                   int remote) const {
+        if (direction == Direction::UP) {
+            if (!invariant(remote >= 0 && remote < system_.remote_count)) {
+                return std::nullopt;
+            }
+            const std::deque<double>& finishes =
+                decode_up_finishes_[static_cast<std::size_t>(remote)];
+            return finishes.empty() ? std::nullopt
+                                    : std::optional<double>(finishes.front());
+        }
+        return decode_down_finishes_.empty()
+                   ? std::nullopt
+                   : std::optional<double>(decode_down_finishes_.front());
+    }
+
+    double decodeBatchService(TaskStep step, int size) const {
+        if (step == TaskStep::PROC) {
+            return taskOccupancy(decode_proc_curve_, size) +
+                   transferServiceTime(size);
+        }
+        if (step == TaskStep::POST) {
+            return taskOccupancy(decode_post_curve_, size);
+        }
+        return taskOccupancy(decode_pre_curve_, size) +
+               transferServiceTime(size);
     }
 
     bool shouldDeferBatch(const ReadySet& ready,
@@ -525,6 +617,7 @@ private:
                           RequestStage pending_stage, int remote,
                           bool already_deferred) const {
         if (already_deferred || ready.empty() ||
+            scoring_.throughput_weight <= 0.0 ||
             mostOverdue({&ready}) != nullptr) {
             return false;
         }
@@ -532,9 +625,35 @@ private:
         const std::size_t potential_size =
             std::min(batch_choices.size() - 1,
                      ready.size() + static_cast<std::size_t>(pending));
-        // ponytail: wait for one guaranteed transfer event only; model the
-        // transfer queues if longer lookahead proves worthwhile.
-        return batch_choices[potential_size] > batch_choices[ready.size()];
+        const int current_batch = batch_choices[ready.size()];
+        const int potential_batch = batch_choices[potential_size];
+        if (potential_batch <= current_batch) {
+            return false;
+        }
+
+        const Direction direction = pending_stage == RequestStage::WAITING_D_UP
+                                        ? Direction::UP
+                                        : Direction::DOWN;
+        const std::optional<double> finish =
+            nextDecodeTransferFinish(direction, remote);
+        if (!invariant(finish.has_value())) {
+            return false;
+        }
+        const TaskStep step = pending_stage == RequestStage::WAITING_D_UP
+                                  ? TaskStep::PROC
+                                  : TaskStep::POST;
+        const double current_rate =
+            current_batch / decodeBatchService(step, current_batch);
+        const double potential_rate =
+            potential_batch / decodeBatchService(step, potential_batch);
+        const double rate_gain =
+            std::max(0.0, potential_rate / current_rate - 1.0);
+        const double wait = std::max(0.0, *finish - current_time_);
+        const double throughput_benefit =
+            scoring_.throughput_weight * rate_gain;
+        const double waiting_penalty =
+            scoring_.waiting_weight * wait / scoring_.slo2;
+        return throughput_benefit > waiting_penalty;
     }
 
     static bool atEnd(std::istringstream& input) {
@@ -712,6 +831,40 @@ private:
         return {priority_time, request.rid};
     }
 
+    void adjustStageCounters(const Request& request, RequestStage stage,
+                             int delta) {
+        if (isDecodeStage(stage)) {
+            const std::size_t remote = static_cast<std::size_t>(request.remote);
+            decode_active_by_remote_[remote] += delta;
+            total_decode_active_ += delta;
+            static_cast<void>(invariant(decode_active_by_remote_[remote] >= 0 &&
+                                        total_decode_active_ >= 0));
+        }
+        if (stage == RequestStage::WAITING_D_UP) {
+            waiting_d_up_[static_cast<std::size_t>(request.remote)] += delta;
+            static_cast<void>(invariant(
+                waiting_d_up_[static_cast<std::size_t>(request.remote)] >= 0));
+        } else if (stage == RequestStage::WAITING_D_DOWN) {
+            waiting_d_down_[static_cast<std::size_t>(request.remote)] += delta;
+            waiting_d_down_total_ += delta;
+            static_cast<void>(invariant(
+                waiting_d_down_[static_cast<std::size_t>(request.remote)] >= 0 &&
+                waiting_d_down_total_ >= 0));
+        } else if (stage == RequestStage::READY_D_PRE) {
+            int& count =
+                ready_d_pre_by_remote_[static_cast<std::size_t>(request.remote)];
+            if (delta > 0 && count == 0) {
+                ++ready_d_pre_remote_count_;
+            }
+            count += delta;
+            if (delta < 0 && count == 0) {
+                --ready_d_pre_remote_count_;
+            }
+            static_cast<void>(invariant(count >= 0 &&
+                                        ready_d_pre_remote_count_ >= 0));
+        }
+    }
+
     void addReady(const Request& request) {
         bool inserted = false;
         const ReadyKey key = readyKey(request);
@@ -776,7 +929,9 @@ private:
 
     void setStage(Request& request, RequestStage stage) {
         removeReady(request);
+        adjustStageCounters(request, request.stage, -1);
         request.stage = stage;
+        adjustStageCounters(request, request.stage, 1);
         addReady(request);
     }
 
@@ -922,6 +1077,11 @@ private:
             remote_busy_[remote] = true;
             remote_tasks_[remote] = assignment.task;
         }
+        if (assignment.task.work == WorkKind::PREFILL &&
+            assignment.task.step == TaskStep::PRE) {
+            ++active_remote_requests_[
+                static_cast<std::size_t>(assignment.task.remote)];
+        }
         for (int rid : assignment.task.request_ids) {
             setStage(*requestAt(rid), runningStageFor(assignment.task));
         }
@@ -959,6 +1119,112 @@ private:
         return true;
     }
 
+    void enqueueTransfer(Direction direction, TransferKind kind, int remote,
+                         std::int64_t size, std::vector<int> request_ids,
+                         double timestamp) {
+        std::deque<QueuedTransfer>& queue =
+            direction == Direction::UP ? up_transfers_ : down_transfers_;
+        double& tail =
+            direction == Direction::UP ? up_transfer_tail_ : down_transfer_tail_;
+        const double start = queue.empty() ? timestamp : std::max(timestamp, tail);
+        tail = start + transferServiceTimeBytes(size);
+        queue.push_back(
+            {kind, remote, size, std::move(request_ids), tail});
+        if (kind == TransferKind::DECODE) {
+            if (direction == Direction::UP) {
+                decode_up_finishes_[static_cast<std::size_t>(remote)].push_back(
+                    tail);
+            } else {
+                decode_down_finishes_.push_back(tail);
+            }
+        }
+    }
+
+    bool enqueueTransfersForTask(const TaskSpec& task, double timestamp) {
+        if (task.work == WorkKind::PREFILL) {
+            if (task.step == TaskStep::POST ||
+                (task.step == TaskStep::PROC &&
+                 task.layer_end < system_.num_layers)) {
+                return true;
+            }
+            const Request* request = requestAt(task.request_ids.front());
+            if (!invariant(request != nullptr)) {
+                return false;
+            }
+            const Direction direction = task.step == TaskStep::PRE
+                                            ? Direction::UP
+                                            : Direction::DOWN;
+            const std::int64_t size =
+                static_cast<std::int64_t>(request->input_length) *
+                system_.bytes_per_token;
+            enqueueTransfer(direction, TransferKind::PREFILL, task.remote, size,
+                            task.request_ids, timestamp);
+            return true;
+        }
+
+        if (task.step == TaskStep::POST) {
+            return true;
+        }
+        if (task.step == TaskStep::PROC) {
+            const std::int64_t size =
+                static_cast<std::int64_t>(task.request_ids.size()) *
+                system_.bytes_per_token;
+            enqueueTransfer(Direction::DOWN, TransferKind::DECODE, task.remote,
+                            size, task.request_ids, timestamp);
+            return true;
+        }
+
+        std::vector<std::vector<int>> by_remote(
+            static_cast<std::size_t>(system_.remote_count));
+        for (int rid : task.request_ids) {
+            const Request* request = requestAt(rid);
+            if (!invariant(request != nullptr)) {
+                return false;
+            }
+            by_remote[static_cast<std::size_t>(request->remote)].push_back(rid);
+        }
+        for (int remote = 0; remote < system_.remote_count; ++remote) {
+            std::vector<int>& ids = by_remote[static_cast<std::size_t>(remote)];
+            if (ids.empty()) {
+                continue;
+            }
+            const std::int64_t size =
+                static_cast<std::int64_t>(ids.size()) * system_.bytes_per_token;
+            enqueueTransfer(Direction::UP, TransferKind::DECODE, remote, size,
+                            std::move(ids), timestamp);
+        }
+        return true;
+    }
+
+    bool consumeTransfer(const Event& event) {
+        std::deque<QueuedTransfer>& queue = event.direction == Direction::UP
+                                                   ? up_transfers_
+                                                   : down_transfers_;
+        if (!invariant(!queue.empty())) {
+            return false;
+        }
+        const QueuedTransfer& expected = queue.front();
+        if (!invariant(expected.kind == event.transfer_kind &&
+                       expected.remote == event.remote &&
+                       expected.size == event.size &&
+                       expected.request_ids == event.request_ids)) {
+            return false;
+        }
+        if (expected.kind == TransferKind::DECODE) {
+            std::deque<double>& finishes =
+                event.direction == Direction::UP
+                    ? decode_up_finishes_[static_cast<std::size_t>(event.remote)]
+                    : decode_down_finishes_;
+            if (!invariant(!finishes.empty() &&
+                           finishes.front() == expected.expected_finish_time)) {
+                return false;
+            }
+            finishes.pop_front();
+        }
+        queue.pop_front();
+        return true;
+    }
+
     bool applyTaskDone(const Event& event, double timestamp) {
         if (!validateTaskShape(event.task) ||
             !invariant(event.server == expectedServer(event.task)) ||
@@ -982,6 +1248,10 @@ private:
             }
             remote_busy_[remote] = false;
             remote_tasks_[remote].reset();
+        }
+
+        if (!enqueueTransfersForTask(event.task, timestamp)) {
+            return false;
         }
 
         const RequestStage next = completedStageFor(event.task);
@@ -1059,6 +1329,9 @@ private:
                 return false;
             }
         }
+        if (!consumeTransfer(event)) {
+            return false;
+        }
         for (int rid : event.request_ids) {
             setStage(*requestAt(rid), next);
         }
@@ -1073,6 +1346,10 @@ private:
         }
         setStage(*request, RequestStage::FINISHED);
         request->finished = true;
+        int& active =
+            active_remote_requests_[static_cast<std::size_t>(request->remote)];
+        --active;
+        static_cast<void>(invariant(active >= 0));
         return true;
     }
 
@@ -1103,7 +1380,13 @@ private:
     SystemConfig system_;
     ScoringConfig scoring_;
     std::vector<TaskTimingRow> task_times_;
-    std::vector<int> best_decode_pre_batch_;
+    TimingCurve prefill_pre_curve_;
+    TimingCurve prefill_proc_curve_;
+    TimingCurve prefill_post_curve_;
+    TimingCurve decode_pre_curve_;
+    TimingCurve decode_proc_curve_;
+    TimingCurve decode_post_curve_;
+    std::vector<std::vector<int>> best_decode_pre_batch_;
     std::vector<int> best_decode_proc_batch_;
     std::vector<int> best_decode_post_batch_;
 
@@ -1114,9 +1397,24 @@ private:
     std::vector<bool> yield_to_decode_;
     std::vector<bool> deferred_d_proc_;
     bool deferred_d_post_ = false;
+    std::vector<int> active_remote_requests_;
+    std::vector<int> decode_active_by_remote_;
+    int total_decode_active_ = 0;
+    std::vector<int> waiting_d_up_;
+    std::vector<int> waiting_d_down_;
+    int waiting_d_down_total_ = 0;
+    std::vector<int> ready_d_pre_by_remote_;
+    int ready_d_pre_remote_count_ = 0;
     std::optional<TaskSpec> edge_task_;
     std::vector<std::optional<TaskSpec>> remote_tasks_;
     int next_remote_ = 0;
+
+    std::deque<QueuedTransfer> up_transfers_;
+    std::deque<QueuedTransfer> down_transfers_;
+    std::vector<std::deque<double>> decode_up_finishes_;
+    std::deque<double> decode_down_finishes_;
+    double up_transfer_tail_ = 0.0;
+    double down_transfer_tail_ = 0.0;
 
     ReadySet ready_p_pre_;
     ReadySet ready_p_post_;
