@@ -313,6 +313,68 @@ def test_decode_group_splits_by_remote(binary):
     check(uplinks >= 2, f"expected several decode uplinks, saw {uplinks}")
 
 
+def test_ready_decode_runs_before_late_uplink(binary):
+    rows = [(1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+            (2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)]
+    result = simulate(scenario(schedule_cost=0.5, latency_ms=5.3,
+                               bandwidth_gbps=1000.0, bytes_per_token=1,
+                               num_layers=1, rows=rows,
+                               slo1=1000.0, slo2=1000.0,
+                               dist_base=100.0, w_tp=1.0, w_c=0.0,
+                               arrivals=[(0.0, 1, 2), (0.1, 1, 1)]),
+                      [binary])
+    check(result.ok, f"late-uplink run failed: {result.error}")
+    decode_proc = [line for line in result.responses.splitlines()
+                   if line.startswith("C0 D PROC")]
+    check(decode_proc[0] == "C0 D PROC 0 1 0",
+          f"ready decode should run before the late uplink: {decode_proc}")
+    check(abs(result.elapsed - 45.300000048) < 1e-9,
+          f"overlapping compute with the uplink should finish at 45.3ms: "
+          f"{result.elapsed}")
+    check_invariants(result)
+
+
+def test_decode_plan_trades_link_latency_for_remote_parallelism(binary):
+    link_bound_rows = [(1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+                       (4, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)]
+    link_bound = simulate(
+        scenario(remote_count=4, schedule_cost=1.0, latency_ms=20.0,
+                 bandwidth_gbps=1000.0, bytes_per_token=1, num_layers=1,
+                 rows=link_bound_rows, slo1=1000.0, slo2=1000.0,
+                 dist_base=100.0, w_tp=1.0, w_c=0.0,
+                 arrivals=[(0.0, 1, 2)] * 4),
+        [binary])
+    check(link_bound.ok, f"link-bound decode run failed: {link_bound.error}")
+    placements = [line.split()[3] for line in link_bound.responses.splitlines()
+                  if line.startswith("E P PRE")]
+    check(placements == ["0"] * 4,
+          f"fixed transfer latency should concentrate placement: {placements}")
+    first_decode_pre = next(line for line in link_bound.responses.splitlines()
+                            if line.startswith("E D PRE"))
+    check(first_decode_pre.startswith("E D PRE -1 2 "),
+          f"the concentrated requests should form two pipeline waves: "
+          f"{first_decode_pre}")
+    check_invariants(link_bound)
+
+    compute_bound_rows = [(1, 0.1, 0.1, 0.1, 0.1, 20.0, 0.1),
+                          (4, 0.1, 0.1, 0.1, 0.1, 80.0, 0.1)]
+    compute_bound = simulate(
+        scenario(remote_count=4, schedule_cost=0.1, latency_ms=0.001,
+                 bandwidth_gbps=1000.0, bytes_per_token=1, num_layers=1,
+                 rows=compute_bound_rows, slo1=1000.0, slo2=1000.0,
+                 dist_base=100.0, w_tp=1.0, w_c=0.0,
+                 arrivals=[(0.0, 1, 2), (1.0, 1, 2),
+                           (2.1, 1, 2), (4.3, 1, 2)]),
+        [binary])
+    check(compute_bound.ok,
+          f"compute-bound decode run failed: {compute_bound.error}")
+    placements = [line.split()[3] for line in compute_bound.responses.splitlines()
+                  if line.startswith("E P PRE")]
+    check(len(set(placements)) >= 2,
+          f"cheap links should retain remote parallelism: {placements}")
+    check_invariants(compute_bound)
+
+
 def test_split_prefill_pieces():
     # Two halves of the public example's 4-layer prefill: each piece costs
     # 2/4 * 10 = 5ms of compute plus its own schedule cost, so P POST lands at
@@ -436,7 +498,9 @@ def main():
                     test_score_scaled_aging_keeps_shortest_prefill,
                     test_prefill_aging_does_not_preempt_ready_post,
                     test_uplink_queues_behind_a_transfer_in_flight,
-                    test_decode_group_splits_by_remote]
+                    test_decode_group_splits_by_remote,
+                    test_ready_decode_runs_before_late_uplink,
+                    test_decode_plan_trades_link_latency_for_remote_parallelism]
     for case in cases:
         case()
     for case in needs_binary:
