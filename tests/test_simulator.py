@@ -189,6 +189,18 @@ def test_one_token_request_has_no_gap(binary):
     check_invariants(result)
 
 
+def test_hidden_output_length_cannot_change_visible_prefix(binary):
+    short = simulate(scenario(num_layers=1, rows=FLAT_ROWS,
+                              arrivals=[(0.0, 1, 1)]), [binary])
+    long = simulate(scenario(num_layers=1, rows=FLAT_ROWS,
+                             arrivals=[(0.0, 1, 3)]), [binary])
+    check(short.ok and long.ok,
+          f"hidden-length runs failed: {short.error}, {long.error}")
+    visible = short.responses.splitlines()[:-1]
+    check(visible == long.responses.splitlines()[:len(visible)],
+          "different hidden output lengths changed the schedule before FIN")
+
+
 def test_shortest_prefill_is_admitted_first(binary):
     rows = [(1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
             (8, 8.0, 80.0, 8.0, 1.0, 1.0, 1.0)]
@@ -311,6 +323,27 @@ def test_decode_group_splits_by_remote(binary):
                       f"a decode uplink carries only C{remote}'s members: {line}")
     check(len(set(placement.values())) > 1, "the run must span more than one remote")
     check(uplinks >= 2, f"expected several decode uplinks, saw {uplinks}")
+
+
+def test_prefill_placement_balances_remaining_compute(binary):
+    rows = [(1, 0.1, 1.0, 0.1, 0.1, 0.1, 0.1),
+            (60, 0.1, 60.0, 0.1, 0.1, 0.1, 0.1),
+            (100, 0.1, 100.0, 0.1, 0.1, 0.1, 0.1)]
+    result = simulate(
+        scenario(remote_count=2, schedule_cost=0.1, latency_ms=0.001,
+                 bandwidth_gbps=1000.0, bytes_per_token=1, num_layers=1,
+                 rows=rows, slo1=1000.0, slo2=1000.0,
+                 dist_base=100.0, w_tp=0.5, w_c=0.5,
+                 arrivals=[(0.0, 100, 1), (1.0, 1, 1), (1.0, 60, 1)]),
+        [binary])
+    check(result.ok, f"weighted-placement run failed: {result.error}")
+    placements = [line.split()[3] for line in result.responses.splitlines()
+                  if line.startswith("E P PRE")]
+    check(placements == ["0", "1", "1"],
+          f"the medium prefill should avoid the busy remote: {placements}")
+    check(result.elapsed < 102.0,
+          f"balanced remote work should finish near 101.1ms: {result.elapsed}")
+    check_invariants(result)
 
 
 def test_ready_decode_runs_before_late_uplink(binary):
@@ -530,12 +563,14 @@ def main():
              test_hanging_scheduler_times_out]
     needs_binary = [test_public_example, test_single_layer_and_repeated_tokens,
                     test_one_token_request_has_no_gap,
+                    test_hidden_output_length_cannot_change_visible_prefix,
                     test_shortest_prefill_is_admitted_first,
                     test_overdue_prefill_beats_shorter_new_arrival,
                     test_score_scaled_aging_keeps_shortest_prefill,
                     test_prefill_aging_does_not_preempt_ready_post,
                     test_uplink_queues_behind_a_transfer_in_flight,
                     test_decode_group_splits_by_remote,
+                    test_prefill_placement_balances_remaining_compute,
                     test_ready_decode_runs_before_late_uplink,
                     test_decode_post_waits_only_when_batch_reduces_drain_time,
                     test_decode_plan_trades_link_latency_for_remote_parallelism]

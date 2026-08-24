@@ -288,8 +288,8 @@ public:
               deferred_d_proc_[static_cast<std::size_t>(remote)])) {
             deferred_d_proc_[static_cast<std::size_t>(remote)] = true;
           } else {
-            task = {WorkKind::DECODE, TaskStep::PROC, remote, -1,
-                -1, decodeProcBatch(decode)};
+            task = {WorkKind::DECODE, TaskStep::PROC, remote, -1, -1,
+                decodeProcBatch(decode)};
             found = true;
           }
         } else if (!prefill.empty()) {
@@ -874,10 +874,27 @@ private:
   int leastLoadedRemote(int remote_limit) const {
     // O(R) for each of at most R assignments; maintain counters
     // only if the request limit grows beyond 2000.
-    std::vector<int> load(static_cast<std::size_t>(system_.remote_count));
+    std::vector<long double> load(
+      static_cast<std::size_t>(system_.remote_count));
+    const int requests_per_remote =
+      (activeRequestCount() + remote_limit - 1) / remote_limit;
+    const int decode_batch = best_decode_proc_batch_[
+      static_cast<std::size_t>(requests_per_remote)];
+    const long double decode_quantum =
+      (system_.schedule_cost + lookupTime(decode_proc_, decode_batch)) /
+      decode_batch;
     for (const std::optional<Request>& request : requests_) {
       if (request && !request->finished && request->remote >= 0) {
-        ++load[static_cast<std::size_t>(request->remote)];
+        const std::size_t remote =
+          static_cast<std::size_t>(request->remote);
+        load[remote] += decode_quantum;
+        if (request->stage <= RequestStage::RUNNING_P_PROC) {
+          const int remaining_layers =
+            system_.num_layers - request->next_prefill_layer;
+          load[remote] += system_.schedule_cost +
+              lookupTime(prefill_proc_, request->input_length) *
+                remaining_layers / system_.num_layers;
+        }
       }
     }
 
