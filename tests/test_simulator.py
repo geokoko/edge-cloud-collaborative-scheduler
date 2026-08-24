@@ -334,6 +334,43 @@ def test_ready_decode_runs_before_late_uplink(binary):
     check_invariants(result)
 
 
+def test_decode_post_waits_only_when_batch_reduces_drain_time(binary):
+    def run(decode_post_for_two):
+        rows = [(1, 0.1, 20.0, 0.1, 0.1, 1.0, 10.0),
+                (2, 0.1, 20.0, 0.1, 0.1, 1.0, decode_post_for_two)]
+        return simulate(
+            scenario(remote_count=2, schedule_cost=0.1, latency_ms=0.1,
+                     bandwidth_gbps=1.0, bytes_per_token=500000,
+                     num_layers=1, rows=rows, slo1=1e6, slo2=1e6,
+                     tp_ub=1.0, tp_base=0.0, dist_base=100.0,
+                     w_tp=1.0, w_c=0.0,
+                     arrivals=[(0.0, 1, 1), (0.0, 1, 1)]),
+            [binary])
+
+    slow_batch = run(19.0)
+    check(slow_batch.ok, f"slow-batch decode run failed: {slow_batch.error}")
+    slow_posts = [line for line in slow_batch.responses.splitlines()
+                  if line.startswith("E D POST")]
+    check(slow_posts[0] == "E D POST -1 1 0",
+          f"a slower combined drain should start immediately: {slow_posts}")
+    check(abs(slow_batch.elapsed - 58.4) < 1e-9,
+          f"two immediate singletons should finish at 58.4ms: "
+          f"{slow_batch.elapsed}")
+    check_invariants(slow_batch)
+
+    fast_batch = run(15.0)
+    check(fast_batch.ok, f"fast-batch decode run failed: {fast_batch.error}")
+    fast_posts = [line for line in fast_batch.responses.splitlines()
+                  if line.startswith("E D POST")]
+    check(fast_posts == ["E D POST -1 2 0 1"],
+          f"a faster combined drain should wait for its second member: "
+          f"{fast_posts}")
+    check(abs(fast_batch.elapsed - 57.4) < 1e-9,
+          f"the beneficial size-2 batch should finish at 57.4ms: "
+          f"{fast_batch.elapsed}")
+    check_invariants(fast_batch)
+
+
 def test_decode_plan_trades_link_latency_for_remote_parallelism(binary):
     link_bound_rows = [(1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
                        (4, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)]
@@ -500,6 +537,7 @@ def main():
                     test_uplink_queues_behind_a_transfer_in_flight,
                     test_decode_group_splits_by_remote,
                     test_ready_decode_runs_before_late_uplink,
+                    test_decode_post_waits_only_when_batch_reduces_drain_time,
                     test_decode_plan_trades_link_latency_for_remote_parallelism]
     for case in cases:
         case()

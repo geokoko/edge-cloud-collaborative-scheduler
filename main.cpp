@@ -1027,15 +1027,36 @@ private:
     return best;
   }
 
-  int pendingCount(RequestStage stage, int remote) const {
-    int count = 0;
-    for (const std::optional<Request>& request : requests_) {
-      if (request && !request->finished && request->stage == stage &&
-        (remote < 0 || request->remote == remote)) {
-        ++count;
+  long double batchDrainFinish(
+      std::size_t ready_count, const std::vector<double>& transfer_times,
+      const std::vector<int>& batch_choices, const TimingCurve& curve,
+      bool wait_for_transfer) const {
+    long double time = current_time_;
+    std::size_t next_transfer = 0;
+    auto collectTransfers = [&] {
+      while (next_transfer < transfer_times.size() &&
+         transfer_times[next_transfer] <= time) {
+        ++ready_count;
+        ++next_transfer;
       }
+    };
+
+    if (wait_for_transfer) {
+      time = std::max<long double>(time, transfer_times.front());
+      collectTransfers();
     }
-    return count;
+    while (ready_count != 0 || next_transfer < transfer_times.size()) {
+      if (ready_count == 0) {
+        time = std::max<long double>(time,
+                       transfer_times[next_transfer]);
+        collectTransfers();
+      }
+      const int batch = batch_choices[ready_count];
+      ready_count -= static_cast<std::size_t>(batch);
+      time += system_.schedule_cost + lookupTime(curve, batch);
+      collectTransfers();
+    }
+    return time;
   }
 
   bool shouldDeferBatch(const ReadySet& ready,
@@ -1043,34 +1064,38 @@ private:
              const TimingCurve& curve,
              RequestStage pending_stage, int remote,
              bool already_deferred) const {
-    if (already_deferred || ready.empty() ||
-      mostOverdue({&ready}) != nullptr) {
+    if (ready.empty() || mostOverdue({&ready}) != nullptr) {
       return false;
     }
-    const int pending = pendingCount(pending_stage, remote);
-    const std::size_t potential_size =
-      std::min(batch_choices.size() - 1,
-           ready.size() + static_cast<std::size_t>(pending));
-    if (batch_choices[potential_size] <= batch_choices[ready.size()]) {
-      return false;
-    }
-    if (scoring_.throughput_weight <= scoring_.waiting_weight) {
-      return true;
-    }
-
-    double next_transfer = std::numeric_limits<double>::infinity();
+    std::vector<double> transfer_times;
     for (const std::optional<Request>& request : requests_) {
       if (request && !request->finished &&
         request->stage == pending_stage &&
         (remote < 0 || request->remote == remote)) {
-        next_transfer =
-          std::min(next_transfer, request->transfer_ready_time);
+        transfer_times.push_back(request->transfer_ready_time);
       }
     }
-    const int batch = batch_choices[ready.size()];
-    const long double current_done =
-      current_time_ + system_.schedule_cost + lookupTime(curve, batch);
-    return next_transfer <= current_done;
+    if (transfer_times.empty()) {
+      return false;
+    }
+    const std::size_t potential_size =
+      std::min(batch_choices.size() - 1,
+           ready.size() + transfer_times.size());
+    if (batch_choices[potential_size] <= batch_choices[ready.size()]) {
+      return false;
+    }
+    if (scoring_.throughput_weight <= scoring_.waiting_weight) {
+      return !already_deferred;
+    }
+
+    std::sort(transfer_times.begin(), transfer_times.end());
+    const long double start_finish = batchDrainFinish(
+      ready.size(), transfer_times, batch_choices, curve, false);
+    const long double wait_finish = batchDrainFinish(
+      ready.size(), transfer_times, batch_choices, curve, true);
+    const long double scale =
+      std::max({1.0L, std::abs(start_finish), std::abs(wait_finish)});
+    return wait_finish + 1.0e-12L * scale < start_finish;
   }
 
   static bool atEnd(std::istringstream& input) {
