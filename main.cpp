@@ -622,7 +622,12 @@ private:
                 return nullptr;
             }
             const double lateness = normalizedLateness(*request);
-            if (lateness < 0.0) {
+            const double threshold =
+                request->stage == RequestStage::READY_P_PRE &&
+                        scoring_.waiting_weight != 0.0
+                    ? std::max(1.0, scoring_.distance_base)
+                    : 0.0;
+            if (lateness < threshold) {
                 continue;
             }
             if (best == nullptr || lateness > best_lateness ||

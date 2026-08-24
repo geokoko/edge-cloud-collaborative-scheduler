@@ -2,6 +2,7 @@
 """Regression tests for the local interactor and scorer in simulator.py."""
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -237,6 +238,42 @@ def test_score_scaled_aging_keeps_shortest_prefill(binary):
     check_invariants(result)
 
 
+def test_prefill_aging_does_not_preempt_ready_post(binary):
+    rows = [(1, 10.0, 1.0, 1.0, 10.0, 2.0, 1.0),
+            (16, 200.0, 4.0, 2.0, 40.0, 8.0, 8.0)]
+    result = simulate(scenario(remote_count=2, schedule_cost=1.0,
+                               latency_ms=0.1, bandwidth_gbps=10.0,
+                               bytes_per_token=1000, num_layers=16,
+                               slo1=20.0, slo2=5.0, tp_ub=1.0,
+                               tp_base=0.0, dist_base=100.0,
+                               w_tp=0.5, w_c=0.5, rows=rows,
+                               arrivals=[(0.0, 16, 1), (0.0, 1, 1),
+                                         (1.1, 1, 1)]), [binary])
+    check(result.ok, f"P PRE aging run failed: {result.error}")
+    edge_prefill = [line for line in result.responses.splitlines()
+                    if line.startswith("E P PRE") or
+                    line.startswith("E P POST")]
+    check(edge_prefill[:4] == ["E P PRE 0 1", "E P PRE 1 2",
+                               "E P POST 0 1", "E P PRE 0 0"],
+          f"ready P POST should precede P PRE within its aging budget: {edge_prefill}")
+    check(result.tdr < 200.0,
+          f"consistent P PRE aging should keep mean TDR below 200ms: {result.tdr}")
+    check(abs(result.elapsed - 259.2016) < 1e-6,
+          f"the ordering change must preserve makespan: {result.elapsed}")
+    check_invariants(result)
+
+    throughput_only = simulate(
+        replace(result.scenario, w_tp=1.0, w_c=0.0), [binary])
+    check(throughput_only.ok,
+          f"throughput-only P PRE aging failed: {throughput_only.error}")
+    edge_prefill = [line for line in throughput_only.responses.splitlines()
+                    if line.startswith("E P PRE") or
+                    line.startswith("E P POST")]
+    check(edge_prefill[2] == "E P PRE 0 0",
+          f"throughput-only arbitration should remain unchanged: {edge_prefill}")
+    check_invariants(throughput_only)
+
+
 def test_uplink_queues_behind_a_transfer_in_flight(binary):
     # 1 token = 10ms latency + 8ms of bits = 18ms on the wire, while P PRE
     # takes only S+1 = 2ms, so the second uplink must queue behind the first.
@@ -397,6 +434,7 @@ def main():
                     test_shortest_prefill_is_admitted_first,
                     test_overdue_prefill_beats_shorter_new_arrival,
                     test_score_scaled_aging_keeps_shortest_prefill,
+                    test_prefill_aging_does_not_preempt_ready_post,
                     test_uplink_queues_behind_a_transfer_in_flight,
                     test_decode_group_splits_by_remote]
     for case in cases:
