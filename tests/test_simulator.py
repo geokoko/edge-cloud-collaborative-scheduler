@@ -605,6 +605,31 @@ def test_ready_final_steps_fill_active_decode_batch(binary):
           f"elapsed={decode_fill.elapsed}, tpot={decode_fill.tpot}")
 
 
+def test_cheap_prefill_uses_active_decode_gap(binary):
+    rows = [(1, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0),
+            (4, 1.0, 2.0, 1.0, 2.0, 4.0, 2.0)]
+    result = simulate(
+        scenario(schedule_cost=1.0, latency_ms=1.0,
+                 bandwidth_gbps=100.0, bytes_per_token=1, num_layers=1,
+                 rows=rows, slo1=50.0, slo2=50.0,
+                 tp_ub=1.0, tp_base=0.0, dist_base=100.0,
+                 w_tp=0.75, w_c=0.25,
+                 arrivals=[(0.0, 1, 2), (0.0, 1, 3),
+                           (30.0, 1, 1)]),
+        [binary])
+    check(result.ok, f"cheap-prefill fill run failed: {result.error}")
+    check_invariants(result)
+
+    edge_tasks = [line for line in result.responses.splitlines()
+                  if line.startswith("E ")]
+    check(edge_tasks.index("E P PRE 0 2") <
+          edge_tasks.index("E D PRE -1 1 1"),
+          f"cheap prefill should use the decode-fill gap: {edge_tasks}")
+    check(result.tasks == 21 and result.elapsed < 48.0 and result.tdr < 9.0,
+          f"cheap admission should overlap work without adding tasks: "
+          f"tasks={result.tasks}, elapsed={result.elapsed}, tdr={result.tdr}")
+
+
 def test_current_workload_can_enable_joint_decode_plan(binary):
     # At the maximum supported workload, linear D PROC work needs both
     # remotes.  Four live requests are link-bound instead, so their current
@@ -921,6 +946,7 @@ def main():
                     test_placement_preserves_known_prefill_work_balance,
                     test_single_remote_avoids_fixed_waves_for_hidden_lengths,
                     test_ready_final_steps_fill_active_decode_batch,
+                    test_cheap_prefill_uses_active_decode_gap,
                     test_current_workload_can_enable_joint_decode_plan,
                     test_finite_decode_drain_merges_ready_waves,
                     test_finite_decode_drain_uses_faster_plan,
